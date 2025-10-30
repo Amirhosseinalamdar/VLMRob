@@ -1,0 +1,34 @@
+# original
+# model:
+#   arch: minigpt4
+#   model_type: pretrain_vicuna0
+#   max_txt_len: 160
+#   end_sym: "###"
+#   low_resource: True
+#   prompt_template: '###Human: {} ###Assistant: '
+#   ckpt: 'please set this value to the path of pretrained checkpoint'
+
+# gpt gave this
+model:
+  arch: minigpt4
+  max_txt_len: 74
+  model_type: pretrain_vicuna0     # matches your CONV_VISION_Vicuna0
+  ckpt: ./checkpoints/pretrained_minigpt4_7b.pth   # projector/adapter weights for MiniGPT-4
+  llama_model: ./models/vicuna-7b-v1.3             # OR "lmsys/vicuna-7b-v1.3"
+  prompt_template: '###Human: {} ###Assistant: '
+  low_resource: true
+  device_8bit: 0
+
+
+datasets:
+  cc_sbu_align:
+    vis_processor:
+      train:
+        name: "blip2_image_eval"
+        image_size: 224
+    text_processor:
+      train:
+        name: "blip_caption"
+
+run:
+  task: image_text_pretrain

@@ -1,0 +1,16 @@
+omegaconf
+iopath
+timm
+opencv-python
+webdataset
+scikit-image
+decord
+wandb
+visual-genome
+peft==0.9.0
+transformers==4.37.2
+accelerate==0.21.0
+bitsandbytes
+diffusers
+huggingface_hub[cli]
+gdown

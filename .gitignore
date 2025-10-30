@@ -1,0 +1,85 @@
+# Archives / compressed
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.zst
+*.7z
+*.rar
+*.json
+*.jsonl
+*.gif
+*.bin
+*.model
+data/*
+# Data files
+*.csv
+*.tsv
+*.jsonl
+*.ndjson
+*.parquet
+*.feather
+*.arrow
+*.orc
+*.h5
+*.hdf5
+*.png
+*.jpg
+*.jpeg
+*.pt
+*.pth
+# Databases / dumps
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+*.mdb
+*.accdb
+
+# Media (often large)
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.wmv
+*.flv
+*.mp3
+*.wav
+*.flac
+*.aac
+*.ogg
+
+# Disk images / installers
+*.iso
+*.dmg
+*.exe
+*.msi
+*.pkg
+*.deb
+*.rpm
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+logs/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+
+# Caches / build outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.cache/
+.venv/
+venv/
+dist/
+build/
+target/
+node_modules/
