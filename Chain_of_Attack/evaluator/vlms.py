@@ -291,164 +291,349 @@ class UniDiffuserCaptioner(BaseVLM):
         txt = out.text[0]
         return VLMOutput(text=txt.strip())
 # ---------- ViECap (optional; requires repo) ----------
+import requests
+import io
+import os
+import sys
+import time
+import subprocess
+import signal
+import psutil
+from PIL import Image
+
 class ViECapCaptioner(BaseVLM):
     name = "ViECap"
-    def __init__(self, repo_root: str, device=None, ckpt_dir: Optional[str] = None):
-        """
-        Minimal wrapper that shells out to ViECap's batch inference if installed.
-        See: https://github.com/FeiElysia/ViECap
-        """
+    
+    def __init__(self, dtype, repo_root: str, device=None, ckpt_dir: Optional[str] = None, server_port: int = 8001):
         self.repo_root = repo_root
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.server_url = f"http://localhost:{server_port}"
         self.ckpt_dir = ckpt_dir
-
+        self._server_process = None
+        self._session = requests.Session()
+        
+        # Start server
+        self._start_server()
+        
+        # Wait for server to be ready
+        self._wait_for_server()
+    
+    def _start_server(self):
+        """Start the ViECap server using the virtual environment"""
+        if self._is_server_running():
+            print("ViECap server is already running")
+            return
+        
+        server_script = os.path.join(self.repo_root, "start_viecap_server.sh")
+        
+        # Prepare environment
+        env = os.environ.copy()
+        if self.ckpt_dir:
+            env["VIECAP_CKPT_DIR"] = self.ckpt_dir
+        
+        print(f"Starting ViECap server from {self.repo_root}...")
+        
+        # Start server process with proper process group
+        self._server_process = subprocess.Popen(
+            [server_script, self.ckpt_dir] if self.ckpt_dir else [server_script],
+            cwd=self.repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid  # Create new process group
+        )
+        
+        # Give server time to start
+        time.sleep(5)
+    
+    def _is_server_running(self):
+        """Check if server is already running"""
+        try:
+            response = self._session.get(f"{self.server_url}/health", timeout=2)
+            return response.status_code == 200
+        except:
+            return False
+    
+    def _wait_for_server(self, timeout=60):
+        """Wait for server to be ready"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                response = self._session.get(f"{self.server_url}/health", timeout=2)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("model_loaded"):
+                        print("ViECap server is ready with model loaded")
+                        return
+                    else:
+                        print("Waiting for model to load...")
+            except Exception as e:
+                print(f"Waiting for server... ({e})")
+            time.sleep(2)
+        
+        raise RuntimeError(f"ViECap server failed to start within {timeout} seconds")
+    
+    def _kill_process_tree(self, pid):
+        """Kill a process and all its children"""
+        try:
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+            
+            # Kill children first
+            for child in children:
+                try:
+                    child.terminate()
+                except:
+                    pass
+            
+            # Wait for children to terminate
+            gone, still_alive = psutil.wait_procs(children, timeout=5)
+            
+            # Force kill any remaining children
+            for child in still_alive:
+                try:
+                    child.kill()
+                except:
+                    pass
+            
+            # Kill parent
+            try:
+                parent.terminate()
+                parent.wait(timeout=5)
+            except:
+                try:
+                    parent.kill()
+                    parent.wait(timeout=5)
+                except:
+                    pass
+                    
+        except psutil.NoSuchProcess:
+            # Process already dead
+            pass
+        except Exception as e:
+            print(f"Error killing process tree: {e}")
+    
     def generate(self, image_pil, prompt: Optional[str] = None, **kw):
-        # ViECap is designed around its own dataloader; here we fallback to single-image infer if the repo is on PYTHONPATH.
-        import sys, io
-        sys.path.append(self.repo_root)
-        from infer_by_instance import infer_image  # hypothetical helper you add that wraps their CLI
-        txt = infer_image(image_pil, ckpt_dir=self.ckpt_dir, device=self.device)
-        return VLMOutput(text=txt.strip())
-
+        # Convert PIL image to bytes
+        img_byte_arr = io.BytesIO()
+        image_pil.save(img_byte_arr, format='JPEG')
+        img_byte_arr = img_byte_arr.getvalue()
+        
+        # Send request to server
+        files = {'image': ('image.jpg', img_byte_arr, 'image/jpeg')}
+        
+        try:
+            response = self._session.post(
+                f"{self.server_url}/generate", 
+                files=files,
+                timeout=30  # 30 second timeout
+            )
+            response.raise_for_status()
+            result = response.json()
+            return VLMOutput(text=result['caption'].strip())
+        
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"ViECap server request failed: {str(e)}")
+    
+    def close(self):
+        """Close the connection and stop the server"""
+        print("Shutting down ViECap server...")
+        
+        # Try to gracefully shutdown via API first
+        try:
+            response = self._session.post(f"{self.server_url}/shutdown", timeout=5)
+            print("Graceful shutdown initiated via API")
+            time.sleep(2)  # Give time for graceful shutdown
+        except:
+            print("API shutdown failed, forcing process termination")
+        
+        # Close session
+        if hasattr(self, '_session'):
+            self._session.close()
+        
+        # Force kill the server process and all its children
+        if hasattr(self, '_server_process') and self._server_process:
+            try:
+                # Get the process ID
+                pid = self._server_process.pid
+                
+                # Kill the entire process tree
+                self._kill_process_tree(pid)
+                
+                # Also try terminating the process directly
+                try:
+                    self._server_process.terminate()
+                    self._server_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        self._server_process.kill()
+                        self._server_process.wait(timeout=5)
+                    except:
+                        pass
+                
+                # Check if process is still alive
+                if self._server_process.poll() is None:
+                    print("Warning: Server process might still be running")
+                else:
+                    print("ViECap server stopped successfully")
+                    
+            except Exception as e:
+                print(f"Error stopping server process: {e}")
+            finally:
+                self._server_process = None
+        
+        # Additional cleanup: kill any remaining processes on our port
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if any('viecap_server.py' in str(arg) for arg in (proc.info['cmdline'] or [])):
+                        if proc.info['pid'] != os.getpid():  # Don't kill ourselves
+                            print(f"Killing leftover ViECap process: {proc.info['pid']}")
+                            proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except:
+            pass
 # ---------- SmallCap (optional; requires repo + datastore) ----------
-# vlm_eval/vlms.py (add below existing imports and classes)
+import os, sys, json, tempfile
+from typing import Optional
+import torch
+from dataclasses import dataclass
+from huggingface_hub import snapshot_download
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, CLIPFeatureExtractor, AutoTokenizer
+import faiss
+import numpy as np
+import clip 
+
 class SmallCapCaptioner(BaseVLM):
     name = "SmallCap"
-
     def __init__(self,
-                 repo_root: str,
-                 model_path: str,
-                 datastore_dir: str,
+                 repo_root: Optional[str] = None,
+                 hf_model_id: str = "Yova/SmallCap7M",
+                 datastore_name: str = "coco",
                  device: Optional[str] = None,
                  dtype: Optional[str] = None,
-                 topk: int = 32,
+                 topk: int = 4,
                  fp16: bool = True,
                  preload: bool = True):
-        """
-        Wrapper for SmallCap demo/infer; requires their retrieval datastore.
-        Repo: https://github.com/RitaRamo/smallcap
-
-        Expected files (typical):
-          - model_path: path to a .pt / .pth checkpoint
-          - datastore_dir: directory with FAISS index + embeddings + metadata built by the repo's scripts
-        """
-        import sys
-        repo_root = "/home/user01/research/smallcap"
-        if not repo_root or not os.path.isdir(repo_root):
-            raise FileNotFoundError(f"SmallCap repo_root not found: {repo_root}")
-        # Make repo importable (src/ must be under repo_root)
-        if repo_root not in sys.path:
-            sys.path.insert(0, repo_root)
-
-        # Device/dtype selection consistent with the rest of the framework
-        dev, dt = _device_and_dtype(device, dtype)
-        self.device = dev
-        self.dtype = dt
+        
+        self.device, self.dtype = _device_and_dtype(device, dtype)
         self.topk = int(topk)
         self.fp16 = bool(fp16)
-
-        # Import SmallCap infer class
-        try:
-            from src.infer import SmallCapInfer
-        except Exception as e:
-            raise ImportError(
-                f"Could not import SmallCapInfer from {repo_root}/src. "
-                f"Ensure the repo is cloned and importable. Original error: {e}"
-            )
-
-        if not model_path or not os.path.isfile(model_path):
-            raise FileNotFoundError(f"SmallCap model checkpoint not found: {model_path}")
-        if not datastore_dir or not os.path.isdir(datastore_dir):
-            raise FileNotFoundError(f"SmallCap datastore_dir not found: {datastore_dir}")
-
-        # Instantiate infer object. The exact signature can vary across commits;
-        # we pass the most common args and use kwargs to be future-proof.
-        try:
-            self.inf = SmallCapInfer(
-                model_path=model_path,
-                datastore_dir=datastore_dir,
-                device=self.device,
-                fp16=self.fp16,
-                topk=self.topk,
-            )
-        except TypeError:
-            # Fallback if infer class doesn't accept fp16/topk in constructor
-            self.inf = SmallCapInfer(
-                model_path=model_path,
-                datastore_dir=datastore_dir,
-                device=self.device,
-            )
-            # Try to set attributes if available
-            if hasattr(self.inf, "topk"):
-                self.inf.topk = self.topk
-            if hasattr(self.inf, "fp16"):
-                self.inf.fp16 = self.fp16
-
-        # Optionally preload the datastore or warm up the model if API exposes it
-        if preload:
-            if hasattr(self.inf, "load_datastore"):
-                try:
-                    self.inf.load_datastore()
-                except Exception:
-                    pass
-            if hasattr(self.inf, "warmup"):
-                try:
-                    self.inf.warmup(device=self.device)
-                except Exception:
-                    pass
-
-        # Prepare a basic torchvision transform if we need a tensor fallback path
-        try:
-            from torchvision import transforms
-            self._tfm = transforms.Compose([
-                transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073),
-                                     std=(0.26862954, 0.26130258, 0.27577711)),  # CLIP ViT-B/32 stats
-            ])
-        except Exception:
-            self._tfm = None
-
+        self.hf_model_id = hf_model_id
+        self.datastore_name = datastore_name
+        
+        # 1) Import the SmallCap model code
+        if repo_root is None or not os.path.isdir(repo_root):
+            repo_root = os.path.join(tempfile.gettempdir(), "smallcap_repo")
+            if not os.path.isdir(repo_root):
+                os.system(f"git clone --depth 1 https://github.com/RitaRamo/smallcap {repo_root}")
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        if os.path.isdir(os.path.join(repo_root, "src")) and repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+            
+        # 2) Import and register custom classes
+        from src.vision_encoder_decoder import SmallCap, SmallCapConfig
+        from src.gpt2 import ThisGPT2Config, ThisGPT2LMHeadModel
+        from src.opt import ThisOPTConfig, ThisOPTForCausalLM
+        from src.utils import prep_strings, postprocess_preds
+        
+        self._prep_strings = prep_strings
+        self._postprocess = postprocess_preds
+        
+        AutoConfig.register("smallcap", SmallCapConfig)
+        AutoModel.register(SmallCapConfig, SmallCap)
+        AutoConfig.register("this_gpt2", ThisGPT2Config)
+        AutoModelForCausalLM.register(ThisGPT2Config, ThisGPT2LMHeadModel)
+        AutoConfig.register("this_opt", ThisOPTConfig)
+        AutoModelForCausalLM.register(ThisOPTConfig, ThisOPTForCausalLM)
+        
+        # 3) Get the checkpoint path from Hugging Face cache
+        checkpoint_path = snapshot_download(
+            hf_model_id, 
+            allow_patterns=["config.json", "pytorch_model.bin", f"{datastore_name}_index*", f"{datastore_name}_index_captions.json"]
+        )
+        
+        # 4) Load model EXACTLY like they do in their code
+        config = AutoConfig.from_pretrained(os.path.join(checkpoint_path, 'config.json'))
+        self.model = AutoModel.from_pretrained(checkpoint_path)
+        self.model.config = config  # THIS IS THE KEY STEP from their code
+        self.model.eval()
+        self.model.to(self.device)
+        
+        if self.fp16 and self.device == "cuda":
+            self.model = self.model.half()
+        
+        # 5) Load tokenizer and feature extractors
+        self._enc_feat = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32")
+        
+        # Determine tokenizer based on config
+        decoder_cfg = getattr(config, "decoder", None)
+        if decoder_cfg is not None and getattr(decoder_cfg, "model_type", None) == "this_opt":
+            tok_name = "facebook/opt-125m"
+        else:
+            tok_name = "gpt2"
+            
+        self._tok = AutoTokenizer.from_pretrained(tok_name)
+        self._tok.pad_token = self._tok.eos_token or "!"
+        
+        # 6) Load retrieval model and FAISS index
+        self._retr_model, self._retr_preproc = clip.load("RN50x64", device=self.device)
+        if self.fp16 and self.device == "cuda":
+            self._retr_model = self._retr_model.half()
+            
+        index_path = os.path.join(checkpoint_path, f"{datastore_name}_index")
+        caps_path = os.path.join(checkpoint_path, f"{datastore_name}_index_captions.json")
+        
+        if not os.path.exists(index_path):
+            raise FileNotFoundError(f"FAISS index not found: {index_path}")
+        if not os.path.exists(caps_path):
+            raise FileNotFoundError(f"Captions JSON not found: {caps_path}")
+            
+        self._faiss = faiss.read_index(index_path)
+        with open(caps_path, "r") as f:
+            self._caps = json.load(f)
+        
+        # 7) Load template
+        tmpl_path = os.path.join(repo_root, "src", "template.txt")
+        if os.path.exists(tmpl_path):
+            self._template = open(tmpl_path).read().strip() + " "
+        else:
+            self._template = "Describe the image in one sentence: "
+    
     @torch.inference_mode()
     def generate(self, image_pil, prompt: Optional[str] = None, **kw) -> VLMOutput:
-        """
-        Runs SmallCap captioning on a single PIL image. Ignores prompt (SmallCap is image->text).
-        """
-        # Ensure RGB image
-        try:
-            im = image_pil.convert("RGB")
-        except Exception:
-            from PIL import Image
-            if isinstance(image_pil, Image.Image):
-                im = image_pil
-            else:
-                raise TypeError("SmallCapCaptioner.generate expects a PIL.Image")
-
-        # Preferred API: SmallCapInfer.caption(PIL.Image)
-        if hasattr(self.inf, "caption"):
-            txt = self.inf.caption(im)
-            return VLMOutput(text=(txt or "").strip())
-
-        # Alternative possible API shapes:
-        # - caption_from_tensor(tensor[B,C,H,W]) -> str
-        # - __call__(PIL.Image) -> str
-        if hasattr(self.inf, "caption_from_tensor") and self._tfm is not None:
-            tensor = self._tfm(im).unsqueeze(0).to(self.device)
-            txt = self.inf.caption_from_tensor(tensor)
-            return VLMOutput(text=(txt or "").strip())
-
-        if callable(self.inf):
-            try:
-                txt = self.inf(im)
-                return VLMOutput(text=(txt or "").strip())
-            except Exception:
-                pass
-
-        raise AttributeError(
-            "SmallCap infer object does not expose a known captioning method. "
-            "Expected one of: .caption(PIL.Image), .caption_from_tensor(tensor), or callable."
+        # 1) Encode image for retrieval
+        img = image_pil.convert("RGB")
+        retr_inp = self._retr_preproc(img).unsqueeze(0).to(self.device)
+        img_emb = self._retr_model.encode_image(retr_inp).detach().float().cpu().numpy()
+        faiss.normalize_L2(img_emb)
+        D, I = self._faiss.search(img_emb, self.topk)
+        retrieved = [self._caps[i] for i in I[0][: self.topk]]
+        
+        # 2) Build decoder input ids
+        dec_ids = self._prep_strings(
+            "", self._tok, template=self._template, retrieved_caps=retrieved, k=len(retrieved), is_test=True
         )
+        
+        # 3) Encode image for SmallCap encoder
+        pixel_values = self._enc_feat(img, return_tensors="pt").pixel_values.to(self.device)
+        
+        # 4) Generate using the model's generate method (should work now)
+        out = self.model.generate(
+            pixel_values=pixel_values,
+            decoder_input_ids=torch.tensor([dec_ids]).to(self.device),
+            max_new_tokens=25,
+            no_repeat_ngram_size=0,
+            length_penalty=0.0,
+            min_length=1,
+            num_beams=3,
+            eos_token_id=self._tok.eos_token_id,
+        )
+        
+        text = self._postprocess(self._tok.decode(out[0]), self._tok)
+        return VLMOutput(text=text.strip())
+
 # ----- FastVLM (Apple) -----
 class FastVLMCaptioner(BaseVLM):
     name = "FastVLM"
@@ -474,7 +659,7 @@ class FastVLMCaptioner(BaseVLM):
                    "--prompt", prompt]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
             if res.returncode != 0:
-                raise RuntimeError(f"FastVLM failed: {res.stderr.strip()[:500]}")
+                raise RuntimeError(f"FastVLM failed: {res.stderr.strip()}")
             # Heuristic: take last non-empty line as the model response.
             out_lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
             text = out_lines[-1] if out_lines else ""
@@ -927,8 +1112,8 @@ REGISTRY = {
     "Qwen2.5-VL-7B": Qwen25VLCaptioner,
     "img2prompt": Img2PromptCaptioner,
     "UniDiffuser": UniDiffuserCaptioner,
-    "FastVLM-0.5B": lambda **kw: FastVLMCaptioner(repo_dir=os.environ.get("FASTVLM_REPO", "./ml-fastvlm"),
-                                                  model_path=os.environ.get("FASTVLM_MODEL", "./ml-fastvlm/checkpoints/fastvlm_0.5b_stage3"),
+    "FastVLM-0.5B": lambda **kw: FastVLMCaptioner(repo_dir=os.environ.get("FASTVLM_REPO", "/home/user01/research/ml-fastvlm"),
+                                                  model_path=os.environ.get("FASTVLM_MODEL", "/home/user01/research/ml-fastvlm/checkpoints/llava-fastvithd_0.5b_stage3"),
                                                   **kw),
     "FastVLM-1.5B": lambda **kw: FastVLMCaptioner(repo_dir=os.environ.get("FASTVLM_REPO", "./ml-fastvlm"),
                                                    model_path=os.environ.get("FASTVLM_MODEL", "./ml-fastvlm/checkpoints/fastvlm_1.5b_stage3"),
@@ -938,12 +1123,19 @@ REGISTRY = {
                                                 **kw),
     "unidiffuser_coa": lambda **kw: UniDiffuserCOACaptioner(**kw),
     "minigpt4": lambda **kw: MiniGPT4SubprocessCaptioner(
-                    repo_dir=os.environ.get("MINIGPT4_REPO", "/home/user01/research/Chain_of_Attack/Clean_text_generation_minigpt4/MiniGPT-4"),
-                    cfg_path=os.environ.get("MINIGPT4_CFG", "eval_configs/minigpt4_eval.yaml"),
-                    cli_name="cli_minigpt4_serve.py",
-                    **kw
-                ),
-    # "SmallCap": SmallCapCaptioner,
+                        repo_dir=os.environ.get("MINIGPT4_REPO", "/home/user01/research/Chain_of_Attack/Clean_text_generation_minigpt4/MiniGPT-4"),
+                        cfg_path=os.environ.get("MINIGPT4_CFG", "eval_configs/minigpt4_eval.yaml"),
+                        cli_name="cli_minigpt4_serve.py",
+                        **kw
+                    ),
+    "ViECap": lambda **kw: ViECapCaptioner(repo_root='/home/user01/research/ViECap', **kw),
+    # "SmallCap": lambda **kw: SmallCapCaptioner(
+    #                     repo_root="/home/user01/research/smallcap",   # or None to auto-clone
+    #                     hf_model_id="Yova/SmallCap7M",                # or "Yova/SmallCapOPT7M"
+    #                     datastore_name="coco",
+    #                     topk=4,
+    #                     fp16=True,
+    #                     **kw
+    #                 ),
     # Optional (install repos manually)
-    # "ViECap": ViECapCaptioner,
 }

@@ -479,35 +479,28 @@ def report_metrics(
     limit: Optional[int] = None,
     clip_batch_size: int = 32,
     vlm_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
-    # --- text judge (Phase 2) ---
-    clean_file_path: Optional[str] = None,   # {"image","text"}
+    clean_file_path: Optional[str] = None,
     judge_model_name: str = "Qwen/Qwen2.5-7B-Instruct",
     judge_device: Optional[str] = None,
     judge_dtype: Optional[str] = None,
     judge_temperature: float = 0.0,
     judge_max_new_tokens: int = 128,
-    # --- memory knobs ---
     free_cuda_between_stages: bool = True,
-    clip_device_override: Optional[str] = None,   # e.g., "cpu" to keep CLIP off the GPU
+    clip_device_override: Optional[str] = None,
+    enable_asr: bool = False,
 ) -> Dict[str, Any]:
     if not os.path.isfile(annotations_jsonl):
         raise FileNotFoundError(f"annotations.jsonl not found: {annotations_jsonl}")
     os.makedirs(out_dir, exist_ok=True)
-
     dev, dt = _device_and_dtype(device, dtype)
     ds = JSONLImageTextDataset(jsonl_path=annotations_jsonl, limit=limit)
     if len(ds) == 0:
         raise RuntimeError("No records found in annotations JSONL.")
-
-    # Persistent folders
-    work_dir   = os.path.join(out_dir, "work")   # Phase 1 outputs
-    judged_dir = os.path.join(out_dir, "judged") # Phase 2 outputs
+    work_dir   = os.path.join(out_dir, "work")
+    judged_dir = os.path.join(out_dir, "judged")
     os.makedirs(work_dir, exist_ok=True)
     os.makedirs(judged_dir, exist_ok=True)
-
-    # Load clean captions map (CPU only)
     clean_map = _load_clean_map(clean_file_path) if clean_file_path else {}
-
     report: Dict[str, Any] = {
         "created_at": datetime.utcnow().isoformat() + "Z",
         "num_samples": len(ds),
@@ -516,28 +509,21 @@ def report_metrics(
         "device": dev,
         "dtype": str(dt).replace("torch.", ""),
         "vlms": {},
+        "asr_enabled": bool(enable_asr and bool(clean_map)),
     }
-
-    # ------- Phase 1: VLM generation (no judge loaded) -------
-    per_vlm_runs = []  # store CSV paths and CLIP scores for Phase 2
-
+    per_vlm_runs = []
     for vlm_name in vlms:
         if vlm_name not in VLM_REGISTRY:
             raise KeyError(f"VLM '{vlm_name}' not registered. Available: {list(VLM_REGISTRY.keys())}")
-
         print(f"[eval] Loading VLM: {vlm_name}")
         vlm_ctor = VLM_REGISTRY[vlm_name]
         per_vlm_kwargs = (vlm_kwargs or {}).get(vlm_name, {})
         vlm = vlm_ctor(device=dev, dtype=str(dt).replace("torch.", ""), **per_vlm_kwargs)
-
         vlm_tag = _safe_name(vlm_name)
         vlm_dir = os.path.join(work_dir, vlm_tag)
         os.makedirs(vlm_dir, exist_ok=True)
-
         results_csv = os.path.join(vlm_dir, f"results_{vlm_tag}.csv")
         print(f"[eval] Generating with {vlm_name} on {len(ds)} samples...")
-
-        # Minimal CSV: no ASR columns yet
         with open(results_csv, "w", newline="", encoding="utf-8") as fcsv:
             writer = csv.writer(fcsv)
             writer.writerow([
@@ -549,16 +535,11 @@ def report_metrics(
                 image_pil = item["image_pil"]
                 image_id = item["image_id"]
                 tgt = (item["target_text"] or "").strip()
-
                 out = vlm.generate(image_pil, prompt=prompt, max_new_tokens=max_new_tokens)
                 pred_txt = (out.text or "").strip()
-
                 clean_key = _to_clean_key(str(image_id))
                 orig_txt = (clean_map.get(clean_key) or "").strip()
-
                 writer.writerow([image_id, clean_key, tgt, orig_txt, pred_txt])
-
-        # Compute CLIP text-text cosine now (can also be deferred), optionally on CPU
         clip_scores = {}
         clip_dev = clip_device_override or dev
         for enc in clip_encoders:
@@ -571,19 +552,15 @@ def report_metrics(
                 limit=limit,
             )
             clip_scores[enc] = score
-
-        # Stash run info for Phase 2
         per_vlm_runs.append({
             "name": vlm_name,
             "results_csv": results_csv,
             "clip_scores": clip_scores,
             "vlm_tag": vlm_tag,
         })
-
-        # Free VLM before moving on
         try:
             if hasattr(vlm, "close"):
-                vlm.close()   # ensures subprocess exits -> GPU memory freed
+                vlm.close()
         finally:
             try:
                 del vlm
@@ -592,11 +569,9 @@ def report_metrics(
             if free_cuda_between_stages and str(dev).startswith("cuda"):
                 import torch
                 torch.cuda.empty_cache()
-
-    # ------- Phase 2: Load the judge once and post-process all CSVs -------
     text_judge = None
-    if clean_map:
-        text_judge = LLMJudge(
+    if enable_asr and clean_map:
+        text_judge = LLLMJudge(
             LLMJudgeConfig(
                 model_name=judge_model_name,
                 device=judge_device or dev,
@@ -605,41 +580,38 @@ def report_metrics(
                 max_new_tokens=judge_max_new_tokens,
             )
         )
-
     for run in per_vlm_runs:
         vlm_name = run["name"]
         vlm_tag  = run["vlm_tag"]
         in_csv   = run["results_csv"]
-
-        out_dir_vlm = os.path.join(judged_dir, vlm_tag)
-        os.makedirs(out_dir_vlm, exist_ok=True)
-        judged_csv = os.path.join(out_dir_vlm, f"results_{vlm_tag}_judged.csv")
-
-        print(f"[eval] Judging outputs for {vlm_name} with {judge_model_name}...")
-        avg_asr = _judge_results_csv(
-            in_csv,
-            judged_csv,
-            clean_map=clean_map,
-            text_judge=text_judge,
-        )
-
+        if enable_asr and text_judge:
+            out_dir_vlm = os.path.join(judged_dir, vlm_tag)
+            os.makedirs(out_dir_vlm, exist_ok=True)
+            judged_csv = os.path.join(out_dir_vlm, f"results_{vlm_tag}_judged.csv")
+            print(f"[eval] Judging outputs for {vlm_name} with {judge_model_name}...")
+            avg_asr = _judge_results_csv(
+                in_csv,
+                judged_csv,
+                clean_map=clean_map,
+                text_judge=text_judge,
+            )
+        else:
+            judged_csv = in_csv
+            avg_asr = None
         report["vlms"][vlm_name] = {
             "results_csv": judged_csv,
             "clip_text_cosine": run["clip_scores"],
             "asr": {
-                "judge_model": judge_model_name if text_judge else None,
+                "judge_model": judge_model_name if (enable_asr and text_judge) else None,
                 "avg_score": avg_asr,
             },
         }
-
     cleanup_eval_artifacts(
         out_dir="output/metrics",
         remove_work=True,
         remove_judged=True,
         remove_report=False,
     )
-
-    # Save consolidated report
     report_path = os.path.join(out_dir, "metrics_report.json")
     with open(report_path, "w", encoding="utf-8") as jf:
         json.dump(report, jf, indent=2)
@@ -648,44 +620,30 @@ def report_metrics(
 
 def print_metrics_report(report: dict,
                          enc_order: list = None,
-                         sort_by: str = "avg",   # "avg", "ASR", or an encoder name to sort by that column
+                         sort_by: str = "avg",
                          reverse: bool = True,
                          use_rich: bool = True,
                          save_path: str = None):
-    """
-    Pretty-print the consolidated metrics report.
-    - enc_order: if provided, use this encoder column order; else infer from the report.
-    - sort_by: "avg" (CLIP avg), "ASR" (judge avg), or a specific encoder name to sort by that column.
-    - reverse: True for descending.
-    - use_rich: try rich table if installed; fallback to ASCII otherwise.
-    - save_path: if provided and use_rich=True, write the pretty table to a text file.
-    """
     vlms = report.get("vlms", {})
     if not vlms:
         print("[eval] No VLM entries found in report.")
         return
-
     encs = enc_order or _collect_encoders(report)
-
-    # Build rows: [VLM, enc1, enc2, ..., AvgCLIP, ASR]
+    include_asr = any(isinstance((data.get("asr") or {}).get("avg_score"), (int, float)) for data in vlms.values())
     rows = []
     for vlm_name, data in vlms.items():
         scores = data.get("clip_text_cosine", {}) or {}
         row_scores = [scores.get(e) for e in encs]
-        # average over available encs
         vals = [v for v in row_scores if isinstance(v, (int, float))]
         avg_clip = sum(vals) / len(vals) if vals else float("nan")
-        # ASR from report
         asr_block = data.get("asr") or {}
         asr = asr_block.get("avg_score", None)
         rows.append((vlm_name, row_scores, avg_clip, asr))
-
-    # Choose sort key
-    if sort_by == "avg":
-        rows.sort(key=lambda r: (-(r[2] if r[2] == r[2] else -1e9)), reverse=False)  # by CLIP avg, NaN-safe
+    if sort_by == "avg" or (sort_by == "ASR" and not include_asr):
+        rows.sort(key=lambda r: (-(r[2] if r[2] == r[2] else -1e9)), reverse=False)
         if reverse:
             rows.reverse()
-    elif sort_by == "ASR":
+    elif sort_by == "ASR" and include_asr:
         def _asr_key(r):
             v = r[3]
             return -(v if isinstance(v, (int, float)) else -1e9)
@@ -693,20 +651,16 @@ def print_metrics_report(report: dict,
         if reverse:
             rows.reverse()
     else:
-        # sort by specific encoder column if present
         try:
             idx = encs.index(sort_by)
             rows.sort(key=lambda r: (-(r[1][idx] if isinstance(r[1][idx], (int, float)) else -1e9)), reverse=False)
             if reverse:
                 rows.reverse()
         except ValueError:
-            pass  # leave unsorted if encoder not found
-
+            pass
     def _fmt(x):
-        return f"{x:.4f}" if isinstance(x, (int, float)) and x == x else "-"  # NaN->"-"
-
-    header = ["VLM"] + encs + ["Avg", "ASR"]
-
+        return f"{x:.4f}" if isinstance(x, (int, float)) and x == x else "-"
+    header = ["VLM"] + encs + ["Avg"] + (["ASR"] if include_asr else [])
     if use_rich:
         try:
             from rich.console import Console
@@ -715,13 +669,14 @@ def print_metrics_report(report: dict,
             for h in header:
                 table.add_column(h, justify="center")
             for name, s_list, avg_clip, asr in rows:
-                table.add_row(name, *[_fmt(v) for v in s_list], _fmt(avg_clip), _fmt(asr))
+                cells = [name] + [_fmt(v) for v in s_list] + [_fmt(avg_clip)]
+                if include_asr:
+                    cells.append(_fmt(asr))
+                table.add_row(*cells)
             console = Console()
             console.print("\n[bold]Evaluation Summary[/bold]")
             console.print(f"Samples: {report.get('num_samples')}  Device: {report.get('device')}  DType: {report.get('dtype')}")
             console.print(table)
-
-            # ---- Optional: save pretty table to file ----
             if save_path:
                 from io import StringIO
                 buffer = StringIO()
@@ -732,22 +687,19 @@ def print_metrics_report(report: dict,
                 with open(save_path, "w", encoding="utf-8") as f:
                     f.write(buffer.getvalue())
                 print(f"\n[Saved metrics table to: {save_path}]")
-            # ---------------------------------------------
             return
         except Exception:
             pass
-
-    # Fallback: ASCII table
     col_widths = [len(h) for h in header]
     data_rows = []
     for name, s_list, avg_clip, asr in rows:
-        cells = [name] + [_fmt(v) for v in s_list] + [_fmt(avg_clip), _fmt(asr)]
+        cells = [name] + [_fmt(v) for v in s_list] + [_fmt(avg_clip)]
+        if include_asr:
+            cells.append(_fmt(asr))
         data_rows.append(cells)
         col_widths = [max(w, len(c)) for w, c in zip(col_widths, cells)]
-
     def line(parts, widths, sep=" | "):
         return sep.join(p.ljust(w) for p, w in zip(parts, widths))
-
     sep_line = "-+-".join("-" * w for w in col_widths)
     print("\nEvaluation Summary")
     print(f"Samples: {report.get('num_samples')}  Device: {report.get('device')}  DType: {report.get('dtype')}")

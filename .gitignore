@@ -1,4 +1,5 @@
 # Archives / compressed
+*.pickle
 *.safetensors
 *.pt
 *.gz

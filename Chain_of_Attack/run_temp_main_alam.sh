@@ -4,7 +4,7 @@ python3 main.py \
   --num_samples 10 \
   --input_res 224 \
   --clip_encoder "ViT-B/32" \
-  --eval_vlms "minigpt4, BLIP" \
+  --eval_vlms "ViECap, BLIP" \
   --eval_clip_encoders "RN50, ViT-B/32" \
   --image_encoder "attackvlm_default" \
   --alpha 1.0 \

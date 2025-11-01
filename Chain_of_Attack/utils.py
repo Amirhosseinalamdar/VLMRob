@@ -229,6 +229,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ot_iters", type=int, default=50)
     p.add_argument("--ot_pos_w", type=float, default=0.0)
     p.add_argument("--combo_weights", type=str, default="1,1,1,0.5,0,0,0")
+    p.add_argument("--do_asr", type=int, default=0)
     # Semantic alignment without strict spatial match:
     # --loss_mode combo --vit_layer -2 --drop_cls --token_downsample 196 --combo_weights "1,1,1,0.5,0,0,0" --ot_reg 0.1 --ot_iters 50
     # Faster runs: set --token_downsample 64–128.

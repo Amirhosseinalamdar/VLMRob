@@ -258,12 +258,12 @@ def main(args):
         vlm_kwargs={},
         clean_file_path=args.cle_file_path,  # JSONL with {"image": "n01440764/ILSVRC2012_val_00010306.JPEG", "text": "..."}
         judge_model_name="Qwen/Qwen2.5-7B-Instruct",
+        enable_asr=bool(args.do_asr),
     )
 
 
     print(f"[eval] Saved consolidated metrics to: {os.path.join(args.output, 'metrics_report.json')}")
     print_metrics_report(report, enc_order=clip_encs)
-
 
 
 
