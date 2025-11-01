@@ -69,40 +69,6 @@ class InstructBLIPCaptioner(BaseVLM):
         out_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
         text = self.processor.decode(out_ids[0], skip_special_tokens=True)
         return VLMOutput(text=text.strip())
-
-# ---------- LLaVA-1.5 (7B/13B) ----------
-# class LLaVACaptioner(BaseVLM):
-#     name = "LLaVA"
-#     def __init__(self, model_id="llava-hf/llava-1.5-7b-hf", device=None, dtype="float16"):
-#         import torch
-#         from transformers import AutoProcessor, LlavaForConditionalGeneration
-
-#         dev, dt = _device_and_dtype(device, dtype)  # your helper; dev can be "cuda" or "cpu"
-#         self.processor = AutoProcessor.from_pretrained(model_id)
-#         self.model = LlavaForConditionalGeneration.from_pretrained(
-#             model_id,
-#             torch_dtype=getattr(torch, dtype) if isinstance(dtype, str) else dtype,
-#             device_map="auto" if dev == "cuda" else None,
-#         )
-#         self.device = dev
-
-#     def generate(self, image_pil, prompt="Describe the image in detail.", max_new_tokens=80, **kw):
-#         # LLaVA expects the <image> token in the chat template
-#         conversation = [{
-#             "role": "user",
-#             "content": [{"type": "image"}, {"type": "text", "text": prompt}],
-#         }]
-#         text = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
-#         inputs = self.processor(images=image_pil, text=text, return_tensors="pt")
-#         inputs = {k: v.to(self.model.device, dtype=self.model.dtype) for k, v in inputs.items()}
-
-#         with torch.no_grad():
-#             out = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
-
-#         # Decode only newly generated tokens (exclude the prompt part)
-#         gen_only = out[:, inputs["input_ids"].shape[-1]:]
-#         resp = self.processor.batch_decode(gen_only, skip_special_tokens=True)[0].strip()
-#         return VLMOutput(text=resp)
 class LLaVACaptioner(BaseVLM):
     name = "LLaVA"
 
@@ -212,17 +178,74 @@ class Qwen25VLCaptioner(BaseVLM):
 # ---------- Img2Prompt (clip-interrogator) ----------
 class Img2PromptCaptioner(BaseVLM):
     name = "Img2Prompt"
-    def __init__(self, clip_model_name: str = "ViT-L-14/openai", device=None):
-        from clip_interrogator import Config, Interrogator
-        dev, _ = _device_and_dtype(device, None)
-        cfg = Config(clip_model_name=clip_model_name)
-        if dev.startswith("cuda"):
-            cfg.apply_low_vram_defaults()  # optional for 8–12GB GPUs
-        self.ci = Interrogator(cfg)
 
-    def generate(self, image_pil, prompt: Optional[str] = None, **kw):
-        txt = self.ci.interrogate(image_pil)
-        return VLMOutput(text=txt.strip())
+    def __init__(
+        self,
+        clip_model_name: str = "ViT-L-14/openai",
+        blip_model_type: str = "large",   # "base" or "large" (and "blip2" on >=0.6.0)
+        low_vram: bool = False,
+        cache_path: Optional[str] = None,
+        download_cache: bool = True,
+        chunk_size: Optional[int] = None,
+        device: Optional[str] = None,
+        dtype: Optional[str] = None,
+    ):
+        # Lazy import so this class is optional
+        try:
+            from clip_interrogator import Config, Interrogator
+        except Exception as e:
+            raise ImportError(
+                "clip-interrogator is required for Img2PromptCaptioner. "
+                "Install with `pip install clip-interrogator==0.5.4` "
+                "or `==0.6.0` for BLIP-2 support."
+            ) from e
+
+        dev, _ = _device_and_dtype(device, dtype)
+        cfg = Config(clip_model_name=clip_model_name)
+
+        # Device (attribute name differs across versions)
+        if hasattr(cfg, "device"):
+            cfg.device = dev
+        elif hasattr(cfg, "torch_device"):
+            cfg.torch_device = dev
+
+        # BLIP model selection differs across versions (backward-compatible)
+        if blip_model_type is not None:
+            if hasattr(cfg, "blip_model_type"):
+                cfg.blip_model_type = blip_model_type  # >= 0.6.0
+            elif hasattr(cfg, "caption_model_name"):
+                # 0.5.x uses caption_model_name like "blip-base"/"blip-large"
+                cfg.caption_model_name = f"blip-{blip_model_type}"
+
+        if cache_path is not None:
+            cfg.cache_path = cache_path
+        if chunk_size is not None:
+            cfg.chunk_size = chunk_size
+        if download_cache is not None and hasattr(cfg, "download_cache"):
+            cfg.download_cache = download_cache
+        if low_vram and hasattr(cfg, "apply_low_vram_defaults"):
+            cfg.apply_low_vram_defaults()
+
+        self._ci = Interrogator(cfg)
+        self.device = dev
+
+    def generate(self, image_pil, prompt: Optional[str] = None, mode: str = "best", **kw) -> VLMOutput:
+        """
+        mode: one of {"best", "fast", "classic", "deep"}
+        - best     -> interrogate()
+        - fast     -> interrogate_fast()
+        - classic  -> interrogate_classic()
+        - deep     -> interrogate_deep()
+        """
+        if mode == "fast" and hasattr(self._ci, "interrogate_fast"):
+            out = self._ci.interrogate_fast(image_pil)
+        elif mode == "classic" and hasattr(self._ci, "interrogate_classic"):
+            out = self._ci.interrogate_classic(image_pil)
+        elif mode == "deep" and hasattr(self._ci, "interrogate_deep"):
+            out = self._ci.interrogate_deep(image_pil)
+        else:
+            out = self._ci.interrogate(image_pil)
+        return VLMOutput(text=str(out).strip())
 
 # ---------- UniDiffuser (image -> text) ----------
 from PIL import Image
@@ -680,7 +703,218 @@ class UniDiffuserCOACaptioner(BaseVLM):
         captions = self.caption_decoder.generate_captions(x)
         text = (captions[0] if isinstance(captions, (list, tuple)) and len(captions) else "").strip()
         return VLMOutput(text=text)
+### minigpt4
+import io, os, sys, json, base64, subprocess, uuid, selectors, threading, time
+from typing import Optional
+from PIL import Image
 
+# from your_project.vlm_base import BaseVLM, VLMOutput
+class MiniGPT4SubprocessCaptioner(BaseVLM):
+    name = "MiniGPT-4"
+
+    def __init__(self,
+                 repo_dir: str = None,
+                 python_path: str = None,
+                 cli_name: str = "cli_minigpt4_serve.py",
+                 cfg_path: str = None,
+                 device: str = None,
+                 timeout: int = 600,
+                 **_):
+        self._p("ENTER __init__")
+        self.repo_dir = repo_dir or os.environ.get("MINIGPT4_REPO", "./MiniGPT-4")
+        self.python = python_path or os.path.join(self.repo_dir, ".venv", "bin", "python")
+        self.cli = os.path.join(self.repo_dir, cli_name)
+        self.cfg_path = cfg_path or os.environ.get("MINIGPT4_CFG", "eval_configs/minigpt4_eval.yaml")
+        self.device = device or os.environ.get("MINIGPT4_DEVICE", "cuda:0")
+        self.timeout = float(timeout)
+
+        self._proc: Optional[subprocess.Popen] = None
+        self._selector: Optional[selectors.BaseSelector] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+
+        self._start_server()
+
+    def close(self):
+        self._p("ENTER close")
+        self._shutdown(kill=False)
+
+    def __del__(self):
+        self._p("ENTER __del__ (best-effort cleanup)")
+        try:
+            self._shutdown(kill=False)
+        except Exception:
+            pass
+
+    # ------------- internals -------------
+    def _p(self, msg: str):
+        sys.stderr.write(f"[minigpt4-client] {msg}\n")
+        sys.stderr.flush()
+
+    def _drain_stderr(self):
+        self._p("ENTER _drain_stderr (child log forwarding)")
+        try:
+            if self._proc and self._proc.stderr:
+                for line in self._proc.stderr:
+                    if not line: break
+                    sys.stderr.write("[minigpt4-child] " + line)
+                    sys.stderr.flush()
+        except Exception as e:
+            self._p(f"_drain_stderr stopped: {e}")
+
+    def _start_server(self):
+        self._p("ENTER _start_server")
+        if not os.path.isfile(self.cli):
+            raise FileNotFoundError(f"serve CLI not found: {self.cli}")
+        if not os.path.isfile(self.python):
+            raise FileNotFoundError(f"python interpreter not found: {self.python}")
+
+        cmd = [self.python, self.cli]
+        self._p(f"launching server: {' '.join(cmd)} (cwd={self.repo_dir})")
+        t0 = time.perf_counter()
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1" 
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self.repo_dir,
+            bufsize=1,
+            text=True,
+            env=env
+        )
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(self._proc.stdout, selectors.EVENT_READ)
+
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+        self._p("sending init handshake to server")
+        self._send({"cmd": "init", "cfg_path": self.cfg_path, "device": self.device})
+        self._p("waiting for init ack from server")
+        resp = self._recv(self.timeout)
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            raise RuntimeError(f"server init failed: {resp}")
+        self._p(f"server ready pid={self._proc.pid} init_time={time.perf_counter()-t0:.2f}s")
+
+    def _server_alive(self) -> bool:
+        return (self._proc is not None) and (self._proc.poll() is None)
+
+    def _send(self, obj):
+        self._p("ENTER _send")
+        if not self._server_alive() or not self._proc.stdin:
+            raise BrokenPipeError("server not alive")
+        self._proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        self._proc.stdin.flush()
+
+    def _recv(self, timeout: float):
+        self._p(f"ENTER _recv (waiting up to {timeout:.1f}s)")
+        if not self._server_alive() or not self._proc.stdout or not self._selector:
+            raise BrokenPipeError("server not alive")
+        deadline = time.perf_counter() + timeout
+        buf_debug = None
+        while time.perf_counter() < deadline:
+            remaining = max(0, deadline - time.perf_counter())
+            events = self._selector.select(remaining)
+            if not events:
+                break  # timeout
+            line = self._proc.stdout.readline()
+            if line is None:
+                continue
+            if line == "":  # EOF from child
+                rc = self._proc.poll()
+                raise RuntimeError(f"server closed stdout (rc={rc}) before sending JSON")
+            s = line.strip()
+            if not s:
+                # blank line; keep waiting
+                continue
+            # Only try to parse lines that look like JSON objects/arrays
+            if not (s.startswith("{") or s.startswith("[")):
+                # capture a short preview for debugging, then keep waiting
+                preview = s if len(s) < 200 else (s[:200] + " ...")
+                self._p(f"_recv: ignoring non-JSON line from server stdout: {preview!r}")
+                buf_debug = preview
+                continue
+            try:
+                return json.loads(s)
+            except json.JSONDecodeError as e:
+                # Partial or corrupted line; keep waiting for next line
+                preview = s if len(s) < 200 else (s[:200] + " ...")
+                self._p(f"_recv: JSON decode error; will continue reading. err={e} line={preview!r}")
+                buf_debug = preview
+                continue
+        # Timeout reached
+        msg = "no data" if buf_debug is None else f"last_line_preview={buf_debug!r}"
+        self._p(f"TIMEOUT in _recv; {msg}")
+        raise TimeoutError("server read timed out")
+        
+    def _shutdown(self, kill: bool = False):
+        self._p(f"ENTER _shutdown kill={kill}")
+        if not self._proc: 
+            self._p("_shutdown: no process")
+            return
+        pid = self._proc.pid
+        try:
+            if self._server_alive() and not kill:
+                self._p("sending close to server")
+                try:
+                    self._send({"cmd": "close"})
+                    _ = self._recv(5.0)
+                except Exception as e:
+                    self._p(f"close handshake error: {e}")
+            if self._proc:
+                (self._proc.kill() if kill else self._proc.terminate())
+                try:
+                    self._proc.wait(timeout=5.0)
+                except Exception:
+                    try:
+                        self._proc.kill(); self._proc.wait(timeout=2.0)
+                    except Exception:
+                        pass
+        finally:
+            rc = self._proc.returncode
+            self._p(f"server exited pid={pid} rc={rc}")
+            try:
+                if self._selector and self._proc and self._proc.stdout:
+                    self._selector.unregister(self._proc.stdout)
+            except Exception:
+                pass
+            self._selector = None
+            self._proc = None
+            self._stderr_thread = None
+
+    # ------------- VLM API -------------
+    def generate(self, image_pil: Image.Image, prompt: str = None,
+                 max_new_tokens: int = 67, temperature: float = 1.0,
+                 num_beams: int = 1, max_length: int = 2000, **kw) -> VLMOutput:
+        self._p("ENTER generate (preparing image)")
+        buf = io.BytesIO()
+        image_pil.save(buf, format="PNG")
+        image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        rid = str(uuid.uuid4())
+        ptxt = prompt or "Describe this image."
+        req = {
+            "cmd": "infer", "id": rid,
+            "prompt": ptxt,
+            "num_beams": num_beams,
+            "temperature": temperature,
+            "max_new_tokens": max_new_tokens,
+            "max_length": max_length,
+            "image_b64": image_b64,
+        }
+
+        self._p(f"generate: SEND id={rid}")
+        t0 = time.perf_counter()
+        self._send(req)
+        self._p(f"generate: WAIT id={rid}")
+        resp = self._recv(self.timeout)
+        if resp.get("id") != rid and "text" not in resp:
+            raise RuntimeError(f"server desync: {resp}")
+        dt = time.perf_counter() - t0
+        text = (resp.get("text") or "").strip()
+        self._p(f"generate: RECV id={rid} dt={dt:.2f}s out_chars={len(text)}")
+        return VLMOutput(text=text)
 
 # Registry
 REGISTRY = {
@@ -691,7 +925,7 @@ REGISTRY = {
     "LLaVA-13B": lambda **kw: LLaVACaptioner(model_id="llava-hf/llava-1.5-13b-hf", **kw),
     "LLaVA-NeXT": LLaVANextCaptioner,
     "Qwen2.5-VL-7B": Qwen25VLCaptioner,
-    "Img2Prompt": Img2PromptCaptioner,
+    "img2prompt": Img2PromptCaptioner,
     "UniDiffuser": UniDiffuserCaptioner,
     "FastVLM-0.5B": lambda **kw: FastVLMCaptioner(repo_dir=os.environ.get("FASTVLM_REPO", "./ml-fastvlm"),
                                                   model_path=os.environ.get("FASTVLM_MODEL", "./ml-fastvlm/checkpoints/fastvlm_0.5b_stage3"),
@@ -703,7 +937,13 @@ REGISTRY = {
                                                 model_path=os.environ.get("FASTVLM_MODEL", "./ml-fastvlm/checkpoints/fastvlm_7b_stage3"),
                                                 **kw),
     "unidiffuser_coa": lambda **kw: UniDiffuserCOACaptioner(**kw),
-    "SmallCap": SmallCapCaptioner,
+    "minigpt4": lambda **kw: MiniGPT4SubprocessCaptioner(
+                    repo_dir=os.environ.get("MINIGPT4_REPO", "/home/user01/research/Chain_of_Attack/Clean_text_generation_minigpt4/MiniGPT-4"),
+                    cfg_path=os.environ.get("MINIGPT4_CFG", "eval_configs/minigpt4_eval.yaml"),
+                    cli_name="cli_minigpt4_serve.py",
+                    **kw
+                ),
+    # "SmallCap": SmallCapCaptioner,
     # Optional (install repos manually)
     # "ViECap": ViECapCaptioner,
 }

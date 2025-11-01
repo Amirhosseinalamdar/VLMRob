@@ -1,4 +1,7 @@
 # Archives / compressed
+*.safetensors
+*.pt
+*.gz
 *.zip
 *.tar
 *.tar.gz

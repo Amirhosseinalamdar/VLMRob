@@ -518,11 +518,11 @@ def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
                     pass
 
 
-######################################################
-######################################################
-######################################################
-######################################################
-######################################################
+############################################################################################################
+############################################################################################################
+############################################################################################################
+############################################################################################################
+############################################################################################################
 
 import math
 from pathlib import Path
@@ -535,12 +535,13 @@ import torchvision
 # -----------------------------
 # Helpers: normalization/resizing
 # -----------------------------
-def _resize_norm(x, size_hw: Tuple[int,int], mean, std):
+def _resize_norm(x, size_hw: Tuple[int, int], mean, std):
     # x in [0,1], shape [B,C,H,W]; returns normalized tensor for encoder
     if x.shape[-2:] != size_hw:
         x = F.interpolate(x, size=size_hw, mode="bilinear", align_corners=False)
-    mean_t = torch.tensor(mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
-    std_t  = torch.tensor(std,  device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+
+    mean_t = torch.as_tensor(mean, dtype=x.dtype, device=x.device).reshape(1, -1, 1, 1)
+    std_t  = torch.as_tensor(std,  dtype=x.dtype, device=x.device).reshape(1, -1, 1, 1)
     return (x - mean_t) / std_t
 
 # -----------------------------
@@ -770,6 +771,7 @@ def build_clip_encoder_losses(device, model_name: Optional[str] = None, pretrain
 # -----------------------------
 # Modified training loop with token losses
 # -----------------------------
+
 def train_attackvlm_losses(args, loader, dev, ann_writer):
     """
     Adds token-space objectives on ViT hidden patch embeddings.
@@ -1242,6 +1244,619 @@ def train_attackvlm_multiencoder_patchgrow(args, loader, dev, ann_writer):
                 ann_writer.write(rec)
             else:
                 # Optional global 'annotations' support
+                try:
+                    annotations.append(rec)  # type: ignore[name-defined]
+                except Exception:
+                    pass
+
+import ast
+from pathlib import Path
+import torch
+import torch.nn.functional as F
+import torchvision
+
+def train_attackvlm_multiencoder_patchgrow_meta(args, loader, dev, ann_writer):
+    """
+    Patch-growth attack with PGD-style updates (same signature as train_attackvlm_multiencoder):
+      - Grows the allowed perturbation region by adding one random patch at a time
+      - Inner optimization is PGD on a global delta image, masked to the current union of patches:
+            delta += alpha * sign(grad);  |delta| <= epsilon; x_adv = clamp(x0 + delta, 0, 1)
+      - Supports meta steps: per-meta patches/iters/alpha/epsilon (and optional logging params)
+
+    Reads (all optional unless noted):
+      - attackvlm_model_name, attackvlm_pretrained (for CLIP encoder; required by your build_clip_encoder)
+      - start_patches (int, default 1), patch_growth (int, default 1), meta_steps (int, default pgd_steps)
+      - inner_steps (int, default 1)
+      - alpha (float, default 4/255), epsilon (float, default 8/255)  -- used when schedule not overriding
+      - meta_schedule:
+          * Python-list string of dicts, e.g.:
+            '[{"patches":1,"iters":10,"alpha":0.01,"epsilon":0.03}, {"patches":2,"iters":20,"alpha":0.01,"epsilon":0.03}]'
+          * or semicolon list "patches:iters:alpha:epsilon", e.g. "1:5:0.01:0.03; 2:10:0.01:0.03"
+          * or a real list in args
+      - multi_target_method: "mean" (default) or "each"
+      - encoder_weights (optional)
+      - seed, output, batch_size, cle_data_root (same as your snippet)
+    """
+
+    # -----------------------------
+    # Encoder(s): CLIP (like your snippet)
+    # -----------------------------
+    clip_name = getattr(args, "attackvlm_model_name", "ViT-B-32")
+    clip_pt   = getattr(args, "attackvlm_pretrained", "openai")
+    device = dev if isinstance(dev, torch.device) else torch.device(dev)
+
+    # Uses your existing helper
+    clip_enc = build_clip_encoder(device, clip_name, clip_pt)  # noqa: F821
+    encoders = [clip_enc]
+
+    # Weights (same behavior as your snippet)
+    def _parse_weights(x):
+        if x is None:
+            return [1.0]
+        if isinstance(x, (list, tuple)):
+            return [float(v) for v in x]
+        if isinstance(x, str):
+            return [float(v) for v in x.split(",")]
+        return [float(x)]
+    weights = _parse_weights(getattr(args, "encoder_weights", None))
+    if len(weights) != len(encoders):
+        weights = [1.0] * len(encoders)
+    weights_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
+    print(f"[enc] Using encoder weights: {weights}")
+
+    # -----------------------------
+    # Meta-step configuration
+    # -----------------------------
+    # default_meta_steps = int(getattr(args, "pgd_steps", 300))
+    start_patches = int(getattr(args, "start_patches", 5))
+    patch_growth  = int(getattr(args, "patch_growth", 5))
+    meta_steps    = int(getattr(args, "meta_steps", 15))
+    inner_steps   = int(getattr(args, "inner_steps", 20))
+
+    # Defaults for PGD
+    alpha_default   = float(getattr(args, "alpha", 4.0)) / 255.0
+    epsilon_default = float(getattr(args, "epsilon", 8.0)) / 255.0
+
+    # Build schedule
+    def _build_auto_schedule():
+        sched = []
+        for m in range(meta_steps):
+            pm = start_patches + m * patch_growth
+            sched.append({"patches": int(pm),
+                          "iters": int(inner_steps - m),
+                          "alpha": float(alpha_default),
+                          "epsilon": float(epsilon_default)})
+        return sched
+
+    meta_schedule = getattr(args, "meta_schedule", None)
+    if meta_schedule is None:
+        schedule = _build_auto_schedule()
+    elif isinstance(meta_schedule, (list, tuple)):
+        schedule = list(meta_schedule)
+    elif isinstance(meta_schedule, str):
+        s = meta_schedule.strip()
+        schedule = None
+        if s.startswith("[") or s.startswith("("):
+            try:
+                schedule = ast.literal_eval(s)
+            except Exception:
+                schedule = None
+        if schedule is None:
+            # "patches:iters:alpha:epsilon; patches:iters:alpha:epsilon; ..."
+            parts = [p.strip() for p in s.split(";") if p.strip()]
+            tmp = []
+            for item in parts:
+                toks = [t.strip() for t in item.split(":")]
+                if len(toks) < 4:
+                    raise ValueError(f"Bad meta_schedule item '{item}', expected 'patches:iters:alpha:epsilon'")
+                tmp.append({"patches": int(toks[0]),
+                            "iters": int(toks[1]),
+                            "alpha": float(toks[2]),
+                            "epsilon": float(toks[3])})
+            schedule = tmp
+    else:
+        raise ValueError("args.meta_schedule must be list/tuple, string, or None")
+
+    if not schedule:
+        raise ValueError("Empty meta schedule")
+    for idx, it in enumerate(schedule):
+        for k in ("patches", "iters", "alpha", "epsilon"):
+            if k not in it:
+                raise ValueError(f"meta schedule entry {idx} must have keys: patches, iters, alpha, epsilon")
+
+    multi_target_method = getattr(args, "multi_target_method", "mean")
+
+    # I/O
+    out_root = Path(args.output).resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+    total_batches = (len(loader.dataset) + getattr(args, "batch_size", 1) - 1) // max(1, getattr(args, "batch_size", 1))
+
+    # Optional CLE root (same as your snippet)
+    cle_root = getattr(args, "cle_data_root", None)
+    if cle_root is None:
+        try:
+            cle_root = CLE_DATA_ROOT  # type: ignore[name-defined]
+        except Exception:
+            cle_root = None
+    if cle_root is not None:
+        cle_root = Path(cle_root).resolve()
+
+    # -----------------------------
+    # Utilities
+    # -----------------------------
+    def _to_int(v):
+        if isinstance(v, int):
+            return v
+        if torch.is_tensor(v):
+            return int(v.item())
+        return int(v)
+
+    def _rand_positions(H, W, ph, pw, k, seed=0):
+        g = torch.Generator().manual_seed(int(seed))
+        ys = torch.randint(0, max(1, H - ph + 1), (k,), generator=g).tolist()
+        xs = torch.randint(0, max(1, W - pw + 1), (k,), generator=g).tolist()
+        return list(zip(ys, xs))
+
+    def _make_patch_masks(H, W, ph, pw, positions):
+        # returns list of (1,1,H,W) binary masks
+        masks = []
+        for (y, x0) in positions:
+            y = _to_int(y); x0 = _to_int(x0)
+            m = torch.zeros(1, 1, H, W)
+            m[:, :, y:y+ph, x0:x0+pw] = 1.0
+            masks.append(m)
+        return masks
+
+    # -----------------------------
+    # Main loop
+    # -----------------------------
+    for i, batch in enumerate(loader):
+        clean_img_255, clean_text, tgt_img_255, tgt_text, clean_abs_paths = batch
+        clean_img_255 = clean_img_255.to(device)  # float32 0..255
+        tgt_img_255   = tgt_img_255.to(device)
+        x0 = (clean_img_255 / 255.0).clamp(0.0, 1.0)
+
+        # Targets: [B,K,C,H,W]
+        if tgt_img_255.dim() == 4:
+            tgt_img_255 = tgt_img_255.unsqueeze(1)
+        elif tgt_img_255.dim() != 5:
+            raise RuntimeError(
+                f"Expected tgt_img_255 to be [B,K,C,H,W] or [B,C,H,W], got {tuple(tgt_img_255.shape)}. "
+                f"Set stack_targets=True in your dataset."
+            )
+        x_tg = (tgt_img_255 / 255.0).clamp(0.0, 1.0)
+        B, K, C, H, W = x_tg.shape
+        assert C == 3, "Expect 3-channel images"
+
+        # Patch size
+        if hasattr(args, "patch_h") and hasattr(args, "patch_w"):
+            ph, pw = int(args.patch_h), int(args.patch_w)
+        else:
+            ps = getattr(args, "patch_size", 32)
+            if isinstance(ps, int):
+                ph = pw = int(ps)
+            else:
+                ph, pw = int(ps[0]), int(ps[1])
+        assert ph <= H and pw <= W, "patch_size must fit inside the image (H,W)"
+
+        # Cache target embeddings per encoder (no grad), same as your snippet
+        with torch.no_grad():
+            cached_targets = []
+            x_tg_flat = x_tg.view(B * K, C, H, W)
+            for enc in encoders:
+                f_tg_flat = enc.target_embed(x_tg_flat)  # [B*K, D], L2-normalized
+                f_tg = f_tg_flat.view(B, K, -1)          # [B,K,D]
+                if multi_target_method == "mean":
+                    f_mean = F.normalize(f_tg.mean(dim=1), dim=-1)  # [B,D]
+                    cached_targets.append(f_mean)
+                else:
+                    cached_targets.append(f_tg)  # [B,K,D]
+
+        # Precompute random positions up to the max patches we will ever use
+        max_patches = max(int(ms["patches"]) for ms in schedule)
+        positions = _rand_positions(H, W, ph, pw, k=max_patches, seed=int(getattr(args, "seed", 0)) + i)
+        patch_masks_11 = _make_patch_masks(H, W, ph, pw, positions)   # list of (1,1,H,W)
+        patch_masks_13 = [m.expand(1, 3, H, W).to(device) for m in patch_masks_11]
+
+        # Global delta, PGD-style (masked to active patches)
+        delta = torch.zeros_like(x0, requires_grad=True)  # (B,3,H,W), starts at 0
+
+        # Run meta steps
+        for m, ms in enumerate(schedule, start=1):
+            Pm = int(ms["patches"])
+            Tm = int(ms["iters"])
+            alpha_m = float(ms["alpha"])
+            eps_m   = float(ms["epsilon"])
+
+            # Union mask of first Pm patches (1,3,H,W), broadcast to (B,3,H,W)
+            union_m = torch.zeros(1, 3, H, W, device=device)
+            for idx in range(Pm):
+                union_m = torch.maximum(union_m, patch_masks_13[idx])
+            # Make sure delta outside mask is zero before we start this meta step
+            with torch.no_grad():
+                delta.mul_(union_m)
+
+            for t in range(1, Tm + 1):
+                # Compose x_adv and compute similarity
+                x_adv = (x0 + delta).clamp(0.0, 1.0)
+                total_sim = 0.0
+                sims = []
+                for k_idx, enc in enumerate(encoders):
+                    f_adv = enc.forward_embed(x_adv)  # [B,D], L2-normalized
+                    if multi_target_method == "mean":
+                        sim_k_b = torch.sum(f_adv * cached_targets[k_idx], dim=1)  # [B]
+                        sim_k = sim_k_b.mean()
+                    else:
+                        sim_bk = torch.einsum("bd,bkd->bk", f_adv, cached_targets[k_idx])  # [B,K]
+                        sim_k = sim_bk.sum(dim=1).mean()
+                    sims.append(sim_k.detach())
+                    total_sim = total_sim + weights_tensor[k_idx] * sim_k
+
+                # PGD-ascent on similarity, but only inside union_m (patch regions)
+                total_sim.backward()
+                with torch.no_grad():
+                    grad = delta.grad
+                    # mask gradient to patch regions
+                    grad.mul_(union_m)
+                    # ascent step
+                    delta.add_(alpha_m * torch.sign(grad))
+                    # project to L_inf and image bounds, and keep outside region at 0
+                    delta.clamp_(-eps_m, eps_m)
+                    delta.copy_((x0 + delta).clamp(0.0, 1.0) - x0)
+                    delta.mul_(union_m)
+                    delta.grad.zero_()
+
+                # Logging
+                if (t % max(1, Tm // 3) == 0) or (t == Tm):
+                    sim_vals = [f"{s.item():.5f}" for s in sims]
+                    max_delta = float(torch.max(torch.abs(delta)).item())
+                    mean_delta = float(torch.mean(torch.abs(delta)).item())
+                    print(
+                        f"iter {i+1}/{total_batches} meta:{m}/{len(schedule)} "
+                        f"t:{t:3d}/{Tm} P={Pm} alpha={alpha_m:.5f} eps={eps_m:.5f} "
+                        f"[patchgrow-PGD/{multi_target_method}] "
+                        f"total_sim={float(total_sim.item()):.5f}, sims={sim_vals}, "
+                        f"max|delta|={max_delta:.4f}, mean|delta|={mean_delta:.4f}"
+                    )
+                    if ann_writer is not None:
+                        try:
+                            ann_writer.add_scalar("debug_patchgrow_pgd/total_sim", float(total_sim.item()),
+                                                  global_step=(i * len(schedule) + m))
+                        except Exception:
+                            pass
+
+        # Final adversarial images
+        with torch.no_grad():
+            adv_image_vis = (x0 + delta).clamp(0.0, 1.0)
+
+        # Save and write annotations (same as your snippet)
+        for b in range(adv_image_vis.size(0)):
+            clean_abs = Path(clean_abs_paths[b]).resolve()
+            class_name = clean_abs.parent.name
+            if cle_root is not None:
+                try:
+                    rel = clean_abs.relative_to(cle_root)
+                    parts = rel.parts
+                    if len(parts) >= 1:
+                        class_name = parts[0]
+                except Exception:
+                    pass
+            class_dir = (out_root / class_name)
+            class_dir.mkdir(parents=True, exist_ok=True)
+            stem = clean_abs.stem
+            out_path = (class_dir / f"{stem}.png").resolve()
+            torchvision.utils.save_image(adv_image_vis[b], str(out_path))
+            rec = {"image": str(out_path), "text": str(tgt_text[b])}
+            if ann_writer is not None:
+                ann_writer.write(rec)
+            else:
+                try:
+                    annotations.append(rec)  # type: ignore[name-defined]
+                except Exception:
+                    pass
+####################################################################################################################
+####################################################################################################################
+####################################################################################################################
+####################################################################################################################
+####################################################################################################################
+####################################################################################################################
+####################################################################################################################
+####################################################################################################################
+####################################################################################################################
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ClipEncoderWithTokensExact(nn.Module):
+    """
+    ViT-only open_clip visual wrapper that:
+      - forward_embed / target_embed: identical to open_clip.encode_image
+        (post ln_post, @visual.proj if present, then L2-normalized).
+      - forward_avg_patch(x, layer in {-1,-2}): average patch tokens at chosen layer,
+        apply the same visual.proj, then L2-normalize so it's in the same space as CLS.
+    Expects inputs in [0,1] range; the wrapper applies CLIP mean/std internally.
+    """
+    def __init__(self, model, device, H=224, W=224):
+        super().__init__()
+        self.model = model.eval()
+        self.device = device
+        self.input_size = (H, W)
+        vis = model.visual
+        mean = getattr(vis, "image_mean", [0.48145466, 0.4578275, 0.40821073])
+        std  = getattr(vis, "image_std",  [0.26862954, 0.26130258, 0.27577711])
+        self.register_buffer("mean", torch.tensor(mean).view(1, 3, 1, 1))
+        self.register_buffer("std",  torch.tensor(std).view(1, 3, 1, 1))
+
+        needed = all(hasattr(vis, n) for n in
+                     ["conv1", "class_embedding", "positional_embedding",
+                      "ln_pre", "transformer", "ln_post"])
+        if not needed:
+            raise NotImplementedError("This wrapper supports ViT-based open_clip visuals only.")
+
+    # ---- Public API ----
+    def forward_embed(self, x):
+        # CLS identical to open_clip.encode_image
+        x_norm = self._normalize(x)
+        z = self.model.encode_image(x_norm)          # open_clip’s official CLS path
+        return F.normalize(z, dim=-1)
+
+    def target_embed(self, x):
+        return self.forward_embed(x)
+
+    def forward_avg_patch(self, x, layer=-1):
+        if layer not in (-1, -2):
+            raise ValueError("layer must be -1 or -2")
+        apply_ln_post = (layer == -1)
+        x_norm = self._normalize(x)
+        tokens = self._tokens(x_norm, take_layer=layer, apply_ln_post=apply_ln_post)  # [B,T,Dm]
+        patch = tokens[:, 1:, :].mean(dim=1)                                         # [B,Dm], exclude CLS
+        patch = self._maybe_proj(patch)                                              # [B,D]
+        return F.normalize(patch, dim=-1)
+
+    # ---- Internals ----
+    def _normalize(self, x):
+        x = x.to(self.device)
+        if x.dtype != torch.float32:
+            x = x.float()
+        return (x - self.mean.to(self.device)) / self.std.to(self.device)
+
+    def _maybe_proj(self, x):
+        vis = self.model.visual
+        if hasattr(vis, "proj") and vis.proj is not None:
+            return x @ vis.proj
+        return x
+
+    def _tokens(self, x_norm, take_layer=-1, apply_ln_post=True):
+        vis = self.model.visual
+        # Patchify
+        x = vis.conv1(x_norm)                                     # [B, Dm, H', W']
+        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)  # [B, N, Dm]
+        # CLS + pos
+        cls = vis.class_embedding.to(x.dtype).unsqueeze(0).expand(x.size(0), -1)
+        x = torch.cat([cls[:, None, :], x], dim=1).contiguous()   # [B, 1+N, Dm]
+        x = x + vis.positional_embedding.to(x.dtype)              # [B, 1+N, Dm]
+        # Pre-norm and blocks
+        x = vis.ln_pre(x)
+        x = x.permute(1, 0, 2).contiguous()                       # [T, B, Dm]
+        blocks = vis.transformer.resblocks
+        target_idx = (len(blocks) - 1) if take_layer == -1 else (len(blocks) - 2)
+        for li, block in enumerate(blocks):
+            x = block(x)
+            if li == target_idx:
+                break
+        x = x.permute(1, 0, 2).contiguous()                       # [B, 1+N, Dm]
+        if apply_ln_post:
+            x = vis.ln_post(x)
+        return x
+
+
+from typing import Optional
+
+def build_clip_encoder_clsavg2cls(device, model_name: Optional[str] = None, pretrained: Optional[str] = None):
+    import open_clip  # lazy import
+    model_name = model_name or "ViT-B-32"
+    pretrained = pretrained or "openai"
+    print(f"[enc] Loading open_clip (attackvlm_default): {model_name} ({pretrained})")
+    model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained, device=device)
+
+    # Infer input size
+    H = W = 224
+    vis = getattr(model, "visual", None)
+    if vis is not None:
+        if hasattr(vis, "image_size"):
+            sz = vis.image_size
+            if isinstance(sz, (tuple, list)) and len(sz) == 2:
+                H, W = int(sz[0]), int(sz[1])
+            elif isinstance(sz, (int, float)):
+                H = W = int(sz)
+        elif hasattr(vis, "input_resolution"):
+            H = W = int(getattr(vis, "input_resolution"))
+
+    return ClipEncoderWithTokensExact(model, device=device, H=H, W=W)
+
+
+def train_attackvlm_multiencoder_clsavg2cls(args, loader, dev, ann_writer):
+    """
+    Multi-encoder PGD attack in pixel space with two similarity terms:
+      1) cls2cls:   adv CLS vs target CLS (existing)
+      2) avg2cls:   avg-patch(hidden, layer=-1 or -2) of adv vs target CLS (new)
+
+    Encoders must implement:
+      - forward_embed(x): [B,D] L2-normalized CLS embedding
+      - target_embed(x):  [B,D] L2-normalized CLS embedding for targets
+    Optional (enables new term):
+      - forward_avg_patch(x, layer: int): [B,D] L2-normalized average of patch tokens
+        at the specified transformer layer (-1 or -2). Excludes the CLS token.
+
+    New/updated args:
+      - avg_token_layer in {-1, -2} (default: -1)
+      - cls2cls_weight (float, default: 1.0)
+      - avg_token2cls_weight (float, default: 1.0)
+    """
+    # Build encoders (unchanged)
+    clip_name = getattr(args, "attackvlm_model_name", "ViT-B-32")
+    clip_pt   = getattr(args, "attackvlm_pretrained", "openai")
+    clip_enc = build_clip_encoder_clsavg2cls(dev, clip_name, clip_pt)
+    encoders = [clip_enc]
+    # Encoder weights across encoders (unchanged)
+    weights = [1.0]
+    weights_tensor = torch.tensor(weights, dtype=torch.float32, device=dev)
+    print(f"[enc] Using encoder weights: {weights}")
+
+    # Attack hyperparameters (pixel space)
+    alpha = getattr(args, "alpha", 4.0) / 255.0
+    epsilon = getattr(args, "epsilon", 8.0) / 255.0
+    steps = getattr(args, "pgd_steps", 300)
+
+    # New similarity weights and layer
+    cls2cls_w = float(getattr(args, "cls2cls_weight", 1.0))
+    avg2cls_w = float(getattr(args, "avg_token2cls_weight", 1.0))
+    avg_layer = int(getattr(args, "avg_token_layer", -1))
+    if avg_layer not in (-1, -2):
+        raise ValueError(f"avg_token_layer must be -1 or -2, got {avg_layer}")
+    print(f"[sim] weights: cls2cls={cls2cls_w}, avg_token2cls={avg2cls_w}, layer={avg_layer}")
+
+    out_root = Path(args.output).resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+    total_batches = (len(loader.dataset) + getattr(args, "batch_size", 1) - 1) // max(1, getattr(args, "batch_size", 1))
+
+    # Optional CLE root for class folders (unchanged)
+    cle_root = getattr(args, "cle_data_root", None)
+    if cle_root is None:
+        try:
+            cle_root = CLE_DATA_ROOT  # type: ignore[name-defined]
+        except Exception:
+            cle_root = None
+    if cle_root is not None:
+        cle_root = Path(cle_root).resolve()
+
+    for i, batch in enumerate(loader):
+        clean_img_255, clean_text, tgt_img_255, tgt_text, clean_abs_paths = batch
+        clean_img_255 = clean_img_255.to(dev)  # float32 0..255
+        tgt_img_255   = tgt_img_255.to(dev)
+        x0 = (clean_img_255 / 255.0).clamp(0.0, 1.0)
+
+        # Expect stacked targets: [B,K,C,H,W] (set stack_targets=True in your dataset)
+        if tgt_img_255.dim() == 4:
+            tgt_img_255 = tgt_img_255.unsqueeze(1)  # [B,1,C,H,W]
+        elif tgt_img_255.dim() != 5:
+            raise RuntimeError(
+                f"Expected tgt_img_255 to be [B,K,C,H,W] or [B,C,H,W], "
+                f"got shape {tuple(tgt_img_255.shape)}. Set stack_targets=True in your dataset."
+            )
+        x_tg = (tgt_img_255 / 255.0).clamp(0.0, 1.0)  # [B,K,C,H,W]
+        B, K = x_tg.size(0), x_tg.size(1)
+        # Cache target CLS embeddings per encoder (no grad)
+        with torch.no_grad():
+            cached_targets = []  # either [B,D] or [B,K,D] depending on method
+            x_tg_flat = x_tg.view(B * K, *x_tg.shape[2:])  # [B*K,C,H,W]
+            for enc in encoders:
+                f_tg_flat = enc.target_embed(x_tg_flat)  # [B*K, D], L2-normalized CLS
+                f_tg = f_tg_flat.view(B, K, -1)          # [B,K,D]
+                if args.multi_target_method == "mean":
+                    f_mean = f_tg.mean(dim=1)            # [B,D]
+                    f_mean = F.normalize(f_mean, dim=-1) # re-normalize mean vector
+                    cached_targets.append(f_mean)        # [B,D]
+                else:  # "each"
+                    cached_targets.append(f_tg)          # [B,K,D]
+
+        # Single perturbation in pixel space
+        delta = torch.zeros_like(x0, requires_grad=True)
+        for j in range(steps):
+            x_adv = (x0 + delta).clamp(0.0, 1.0)
+
+            total_sim = 0.0
+            sims = []          # per-encoder total (weighted) sim for logging
+            sims_breakdown = []  # (cls2cls, avg2cls) per-encoder
+
+            for k, enc in enumerate(encoders):
+                # CLS embedding of adversarial image
+                f_adv_cls = enc.forward_embed(x_adv)  # [B,D], L2-normalized
+
+                # Optional: average of patch tokens at layer {avg_layer}
+                f_adv_avg = None
+                if hasattr(enc, "forward_avg_patch"):
+                    try:
+                        f_adv_avg = enc.forward_avg_patch(x_adv, layer=avg_layer)  # [B,D], L2-normalized
+                    except Exception as e:
+                        # Keep training with CLS only if encoder doesn't support tokens
+                        if j == 0 and i == 0:
+                            print(f"[warn] forward_avg_patch failed for encoder {k}: {e}. Using CLS only.")
+                        f_adv_avg = None
+
+                tgt = cached_targets[k]  # [B,D] or [B,K,D]
+
+                if args.multi_target_method == "mean":
+                    # tgt: [B,D]
+                    cls_b = torch.sum(f_adv_cls * tgt, dim=1)                     # [B]
+                    sim_cls = cls_b.mean()                                        # scalar
+                    if f_adv_avg is not None:
+                        avg_b = torch.sum(f_adv_avg * tgt, dim=1)                 # [B]
+                        sim_avg = avg_b.mean()
+                    else:
+                        sim_avg = torch.tensor(0.0, device=dev)
+                else:
+                    # tgt: [B,K,D]
+                    cls_bk = torch.einsum("bd,bkd->bk", f_adv_cls, tgt)           # [B,K]
+                    sim_cls = cls_bk.sum(dim=1).mean()                            # scalar
+                    if f_adv_avg is not None:
+                        avg_bk = torch.einsum("bd,bkd->bk", f_adv_avg, tgt)       # [B,K]
+                        sim_avg = avg_bk.sum(dim=1).mean()
+                    else:
+                        sim_avg = torch.tensor(0.0, device=dev)
+
+                # Combine the two sims for this encoder with user weights
+                sim_k = cls2cls_w * sim_cls + avg2cls_w * sim_avg
+                sims_breakdown.append((float(sim_cls.detach()), float(sim_avg.detach())))
+                sims.append(sim_k.detach())
+                total_sim = total_sim + weights_tensor[k] * sim_k
+
+            # Gradient ascent on similarity
+            total_sim.backward()
+            with torch.no_grad():
+                grad = delta.grad
+                delta.add_(alpha * torch.sign(grad))
+                delta.clamp_(-epsilon, epsilon)
+                delta.copy_((x0 + delta).clamp(0.0, 1.0) - x0)
+                delta.grad.zero_()
+
+            # Logging
+            if (j % max(1, steps // 10) == 0) or (j == steps - 1):
+                max_delta = torch.max(torch.abs(delta)).item()
+                mean_delta = torch.mean(torch.abs(delta)).item()
+                sim_vals = [f"{s.item():.5f}" for s in sims]
+                bd_vals = [f"(cls:{c:.5f},avg:{a:.5f})" for (c,a) in sims_breakdown]
+                method = args.multi_target_method
+                print(
+                    f"iter {i+1}/{total_batches} step:{j:3d} [{method}] "
+                    f"total_sim={float(total_sim.item()):.5f}, sims={sim_vals}, per-enc={bd_vals}, "
+                    f"max|delta|={max_delta:.4f}, mean|delta|={mean_delta:.4f}"
+                )
+
+        with torch.no_grad():
+            adv_image_vis = (x0 + delta).clamp(0.0, 1.0)
+
+        # Save under class folders and write annotation (unchanged)
+        for b in range(adv_image_vis.size(0)):
+            clean_abs = Path(clean_abs_paths[b]).resolve()
+            class_name = clean_abs.parent.name
+            if cle_root is not None:
+                try:
+                    rel = clean_abs.relative_to(cle_root)
+                    parts = rel.parts
+                    if len(parts) >= 1:
+                        class_name = parts[0]
+                except Exception:
+                    pass
+            class_dir = (out_root / class_name)
+            class_dir.mkdir(parents=True, exist_ok=True)
+            stem = clean_abs.stem
+            out_path = (class_dir / f"{stem}.png").resolve()
+            torchvision.utils.save_image(adv_image_vis[b], str(out_path))
+            rec = {"image": str(out_path), "text": str(tgt_text[b])}
+            if ann_writer is not None:
+                ann_writer.write(rec)
+            else:
                 try:
                     annotations.append(rec)  # type: ignore[name-defined]
                 except Exception:

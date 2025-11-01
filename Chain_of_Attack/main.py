@@ -14,7 +14,7 @@ from utils import parse_list_arg, seed_everything
 from eval_utils import print_metrics_report
 import torchvision
 import torch.nn.functional as F
-from trainers import train_attackvlm_multiencoder, train_attackvlm_losses, train_attackvlm_multiencoder_patchgrow
+from trainers import *
 from ViT_PyTorch.pytorch_pretrained_vit import ViT
 
     
@@ -230,7 +230,7 @@ def main(args):
         elif 'losses' in args.method:
             train_attackvlm_losses(args, loader, dev, ann_writer)
         elif 'grow' in args.method:
-            train_attackvlm_multiencoder_patchgrow(args, loader, dev, ann_writer)
+            train_attackvlm_multiencoder_clsavg2cls(args, loader, dev, ann_writer)
         else:
             train_attackvlm(args, loader, dev, ann_writer)
 
@@ -256,7 +256,11 @@ def main(args):
         limit=None,
         clip_batch_size=32,
         vlm_kwargs={},
+        clean_file_path=args.cle_file_path,  # JSONL with {"image": "n01440764/ILSVRC2012_val_00010306.JPEG", "text": "..."}
+        judge_model_name="Qwen/Qwen2.5-7B-Instruct",
     )
+
+
     print(f"[eval] Saved consolidated metrics to: {os.path.join(args.output, 'metrics_report.json')}")
     print_metrics_report(report, enc_order=clip_encs)
 
