@@ -69,6 +69,7 @@ class InstructBLIPCaptioner(BaseVLM):
         out_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
         text = self.processor.decode(out_ids[0], skip_special_tokens=True)
         return VLMOutput(text=text.strip())
+
 class LLaVACaptioner(BaseVLM):
     name = "LLaVA"
 
@@ -113,6 +114,69 @@ class LLaVACaptioner(BaseVLM):
         gen_only = out[:, inputs["input_ids"].shape[-1]:]
         resp = self.processor.batch_decode(gen_only, skip_special_tokens=True)[0].strip()
         return VLMOutput(text=resp)
+
+
+class LLaVACaptioner_Batch(BaseVLM):
+    name = "LLaVA"
+
+    def __init__(self, model_id="llava-hf/llava-1.5-7b-hf", device=None, dtype="float16"):
+        import torch
+        from transformers import AutoProcessor, LlavaForConditionalGeneration
+
+        dev, dt = _device_and_dtype(device, dtype)  # helper: returns device and dtype
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = LlavaForConditionalGeneration.from_pretrained(
+            model_id,
+            torch_dtype=getattr(torch, dtype) if isinstance(dtype, str) else dtype,
+            device_map="auto" if dev == "cuda" else None,
+        )
+        self.device = dev
+
+    def generate(self, images_pil, prompt="Describe the image in detail.", max_new_tokens=80, **kw):
+        """
+        images_pil: list of PIL images
+        returns: list of VLMOutput for each image
+        """
+        import torch
+
+        if not isinstance(images_pil, list):
+            images_pil = [images_pil]  # handle single image as a list
+
+        batch_conversations = []
+        for _ in images_pil:
+            conversation = [{
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": prompt}],
+            }]
+            text = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
+            batch_conversations.append(text)
+
+        # Process the batch of images and corresponding prompts
+        inputs = self.processor(images=images_pil, text=batch_conversations, return_tensors="pt")
+
+        # Move tensors to the correct device
+        for k, v in inputs.items():
+            if not isinstance(v, torch.Tensor):
+                continue
+            if v.dtype.is_floating_point:
+                inputs[k] = v.to(self.model.device, dtype=self.model.dtype)
+            else:
+                inputs[k] = v.to(self.model.device)
+
+        with torch.no_grad():
+            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+
+        # Decode outputs per image
+        batch_outputs = []
+        for i in range(len(images_pil)):
+            start_idx = inputs["input_ids"].shape[1] * i
+            end_idx = start_idx + inputs["input_ids"].shape[1]
+            gen_only = out[i, inputs["input_ids"].shape[1]:]  # only generated tokens
+            resp = self.processor.batch_decode(gen_only.unsqueeze(0), skip_special_tokens=True)[0].strip()
+            batch_outputs.append(VLMOutput(text=resp).text)
+
+        return batch_outputs
+
 # ---------- LLaVA-NeXT (v1.6) ----------
 class LLaVANextCaptioner(BaseVLM):
     name = "LLaVA-NeXT"
@@ -1107,6 +1171,7 @@ REGISTRY = {
     "BLIP-2": BLIP2Captioner,
     "InstructBLIP": InstructBLIPCaptioner,
     "LLaVA-7B": lambda **kw: LLaVACaptioner(model_id="llava-hf/llava-1.5-7b-hf", **kw),
+    "LLaVA-7B-Batch": lambda **kw: LLaVACaptioner_Batch(model_id="llava-hf/llava-1.5-7b-hf", **kw),
     "LLaVA-13B": lambda **kw: LLaVACaptioner(model_id="llava-hf/llava-1.5-13b-hf", **kw),
     "LLaVA-NeXT": LLaVANextCaptioner,
     "Qwen2.5-VL-7B": Qwen25VLCaptioner,

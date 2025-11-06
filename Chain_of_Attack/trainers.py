@@ -350,6 +350,174 @@ def build_msn_encoder(device, model_name: str | None = None) -> BaseEncoder:
 
 # -------------- Training Function --------------
 
+# def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
+#     """
+#     Multi-encoder PGD attack in pixel space.
+#     Encoders:
+#       - CLIP via open_clip (attackvlm_default)
+#       - DINO via timm (prefers vit_small if available)
+#       - MAE  via timm (uses vit_base_patch16_224.mae by default)
+
+#     Required/optional args fields:
+#       - attackvlm_model_name, attackvlm_pretrained (for CLIP)
+#       - dino_model_name (optional)
+#       - mae_model_name  (optional)
+#       - alpha, epsilon  (pixel units, e.g., 4 / 8)
+#       - pgd_steps (default: 300)
+#       - batch_size, output
+#       - encoder_weights (optional: [w1,w2,w3] or "w1,w2,w3")
+#       - cle_data_root (optional: root Path for class-name derivation)
+#     """
+#     # Build encoders
+#     clip_name = getattr(args, "attackvlm_model_name", "ViT-B-32")
+#     clip_pt   = getattr(args, "attackvlm_pretrained", "openai")
+#     clip_enc = build_clip_encoder(dev, clip_name, clip_pt)
+
+#     encoders = [clip_enc]
+
+#     # Encoder weights
+#     weights = [1.0]
+#     weights_tensor = torch.tensor(weights, dtype=torch.float32, device=dev)
+#     print(f"[enc] Using encoder weights: {weights}")
+
+#     # Attack hyperparameters (pixel space)
+#     alpha = getattr(args, "alpha", 4.0) / 255.0
+#     epsilon = getattr(args, "epsilon", 8.0) / 255.0
+#     steps = getattr(args, "pgd_steps", 300)
+
+#     out_root = Path(args.output).resolve()
+#     out_root.mkdir(parents=True, exist_ok=True)
+#     total_batches = (len(loader.dataset) + getattr(args, "batch_size", 1) - 1) // max(1, getattr(args, "batch_size", 1))
+
+#     # Optional CLE root for class folders
+#     cle_root = getattr(args, "cle_data_root", None)
+#     if cle_root is None:
+#         # If a global exists, use it; else keep None
+#         try:
+#             cle_root = CLE_DATA_ROOT  # type: ignore[name-defined]
+#         except Exception:
+#             cle_root = None
+#     if cle_root is not None:
+#         cle_root = Path(cle_root).resolve()
+
+#     for i, batch in enumerate(loader):
+#         clean_img_255, clean_text, tgt_img_255, tgt_text, clean_abs_paths = batch
+#         clean_img_255 = clean_img_255.to(dev)  # float32 0..255
+#         tgt_img_255   = tgt_img_255.to(dev)
+
+#         x0 = (clean_img_255 / 255.0).clamp(0.0, 1.0)
+#         # Expect stacked targets: [B,K,C,H,W] (set stack_targets=True in your dataset)
+#         if tgt_img_255.dim() == 4:
+#             # No multi-targets present, treat as K=1
+#             tgt_img_255 = tgt_img_255.unsqueeze(1)  # [B,1,C,H,W]
+#         elif tgt_img_255.dim() != 5:
+#             raise RuntimeError(
+#                 f"Expected tgt_img_255 to be [B,K,C,H,W] or [B,C,H,W], "
+#                 f"got shape {tuple(tgt_img_255.shape)}. Set stack_targets=True in your dataset."
+#             )
+
+#         x_tg = (tgt_img_255 / 255.0).clamp(0.0, 1.0)  # [B,K,C,H,W]
+#         B, K = x_tg.size(0), x_tg.size(1)
+
+#         # Cache target embeddings per encoder (no grad)
+#         with torch.no_grad():
+#             # Will hold, per encoder:
+#             # - for 'mean': [B,D] normalized
+#             # - for 'each': [B,K,D], each feature normalized
+#             cached_targets = []
+#             x_tg_flat = x_tg.view(B * K, *x_tg.shape[2:])  # [B*K,C,H,W]
+#             for enc in encoders:
+#                 f_tg_flat = enc.target_embed(x_tg_flat)  # [B*K, D], assumed L2-normalized
+#                 f_tg = f_tg_flat.view(B, K, -1)          # [B,K,D]
+#                 if args.multi_target_method == "mean":
+#                     f_mean = f_tg.mean(dim=1)            # [B,D]
+#                     f_mean = F.normalize(f_mean, dim=-1) # re-normalize mean vector
+#                     cached_targets.append(f_mean)        # [B,D]
+#                 else:  # "each"
+#                     # Keep all per-target embeddings
+#                     cached_targets.append(f_tg)          # [B,K,D]
+
+#         # Single perturbation in pixel space
+#         delta = torch.zeros_like(x0, requires_grad=True)
+#         for j in range(steps):
+#             x_adv = (x0 + delta).clamp(0.0, 1.0)
+
+#             # Sum cosine similarities across encoders (and across targets if method='each')
+#             total_sim = 0.0
+#             sims = []  # per-encoder scalar for logging
+#             for k, enc in enumerate(encoders):
+#                 f_adv = enc.forward_embed(x_adv)  # [B,D], L2-normalized
+
+#                 if args.multi_target_method == "mean":
+#                     # cached_targets[k]: [B,D]
+#                     sim_k_b = torch.sum(f_adv * cached_targets[k], dim=1)  # [B]
+#                     sim_k = sim_k_b.mean()  # scalar
+#                 else:
+#                     # cached_targets[k]: [B,K,D]
+#                     # Cosine for each target: (B,D) x (B,K,D) -> (B,K)
+#                     sim_bk = torch.einsum("bd,bkd->bk", f_adv, cached_targets[k])  # [B,K]
+#                     # Sum over K targets, then mean over batch
+#                     sim_k = sim_bk.sum(dim=1).mean()  # scalar; max = K if all 1's
+
+#                 sims.append(sim_k.detach())
+#                 total_sim = total_sim + weights_tensor[k] * sim_k
+
+#             # Gradient ascent on similarity
+#             total_sim.backward()
+#             with torch.no_grad():
+#                 grad = delta.grad
+#                 delta.add_(alpha * torch.sign(grad))
+#                 # Project onto L_inf ball and image bounds
+#                 delta.clamp_(-epsilon, epsilon)
+#                 delta.copy_((x0 + delta).clamp(0.0, 1.0) - x0)
+#                 delta.grad.zero_()
+
+#             # Logging
+#             if (j % max(1, steps // 10) == 0) or (j == steps - 1):
+#                 max_delta = torch.max(torch.abs(delta)).item()
+#                 mean_delta = torch.mean(torch.abs(delta)).item()
+#                 sim_vals = [f"{s.item():.5f}" for s in sims]
+#                 method = args.multi_target_method
+
+#                 print(
+#                     f"iter {i+1}/{total_batches} step:{j:3d} [{method}] "
+#                     f"total_sim={float(total_sim.item())/K:.5f}, sims={sim_vals}, "
+#                     f"max|delta|={max_delta:.4f}, mean|delta|={mean_delta:.4f}"
+#                 )
+
+#         with torch.no_grad():
+#             adv_image_vis = (x0 + delta).clamp(0.0, 1.0)
+
+#         # Save under class folders and write annotation
+#         for b in range(adv_image_vis.size(0)):
+#             clean_abs = Path(clean_abs_paths[b]).resolve()
+#             # Derive class name
+#             class_name = clean_abs.parent.name
+#             if cle_root is not None:
+#                 try:
+#                     rel = clean_abs.relative_to(cle_root)
+#                     parts = rel.parts
+#                     if len(parts) >= 1:
+#                         class_name = parts[0]
+#                 except Exception:
+#                     pass
+
+#             class_dir = (out_root / class_name)
+#             class_dir.mkdir(parents=True, exist_ok=True)
+#             stem = clean_abs.stem
+#             out_path = (class_dir / f"{stem}.png").resolve()
+#             torchvision.utils.save_image(adv_image_vis[b], str(out_path))
+
+#             rec = {"image": str(out_path), "text": str(tgt_text[b])}
+#             if ann_writer is not None:
+#                 ann_writer.write(rec)
+#             else:
+#                 # Optional global 'annotations' support
+#                 try:
+#                     annotations.append(rec)  # type: ignore[name-defined]
+#                 except Exception:
+#                     pass
+
 def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
     """
     Multi-encoder PGD attack in pixel space.
@@ -357,7 +525,6 @@ def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
       - CLIP via open_clip (attackvlm_default)
       - DINO via timm (prefers vit_small if available)
       - MAE  via timm (uses vit_base_patch16_224.mae by default)
-
     Required/optional args fields:
       - attackvlm_model_name, attackvlm_pretrained (for CLIP)
       - dino_model_name (optional)
@@ -367,28 +534,56 @@ def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
       - batch_size, output
       - encoder_weights (optional: [w1,w2,w3] or "w1,w2,w3")
       - cle_data_root (optional: root Path for class-name derivation)
+      - clean_sim_weight (new): weight for negative clean similarity loss
+      - target_weights (new): per-target weights for each encoder (list of lists)
     """
     # Build encoders
     clip_name = getattr(args, "attackvlm_model_name", "ViT-B-32")
     clip_pt   = getattr(args, "attackvlm_pretrained", "openai")
     clip_enc = build_clip_encoder(dev, clip_name, clip_pt)
-
     encoders = [clip_enc]
-
     # Encoder weights
     weights = [1.0]
     weights_tensor = torch.tensor(weights, dtype=torch.float32, device=dev)
     print(f"[enc] Using encoder weights: {weights}")
-
+    
     # Attack hyperparameters (pixel space)
     alpha = getattr(args, "alpha", 4.0) / 255.0
     epsilon = getattr(args, "epsilon", 8.0) / 255.0
     steps = getattr(args, "pgd_steps", 300)
-
+    
+    # New: clean similarity loss weight
+    clean_sim_weight = getattr(args, "clean_sim_weight", 0.5)
+    print(f"[loss] Clean similarity weight: {clean_sim_weight}")
+    
+    # New: target weights for each encoder
+    target_weights = getattr(args, "target_weights", "0.2,0.2,0.2,0.05,0.05,0.05,0.05,0.05,0.05,0.05,0.05")
+    if target_weights is not None:
+        if isinstance(target_weights, str):
+            # Parse string like "1.0,0.8,0.5" or "1.0;0.8;0.5"
+            separator = ',' if ',' in target_weights else ';'
+            target_weights = [[float(w.strip()) for w in tw.split(separator)] 
+                             for tw in target_weights.split('|')] if '|' in target_weights else \
+                            [float(w.strip()) for w in target_weights.split(separator)]
+        
+        # Convert to list of tensors
+        target_weights_tensors = []
+        for i, tw in enumerate(target_weights):
+            if isinstance(tw, list):
+                # Per-target weights for this encoder
+                tw_tensor = torch.tensor(tw, dtype=torch.float32, device=dev)
+            else:
+                # Single weight for all targets in this encoder
+                tw_tensor = torch.tensor([tw], dtype=torch.float32, device=dev).repeat(11)
+            target_weights_tensors.append(tw_tensor)
+        print(f"[loss] Target weights: {target_weights}")
+    else:
+        target_weights_tensors = None
+    
     out_root = Path(args.output).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     total_batches = (len(loader.dataset) + getattr(args, "batch_size", 1) - 1) // max(1, getattr(args, "batch_size", 1))
-
+    
     # Optional CLE root for class folders
     cle_root = getattr(args, "cle_data_root", None)
     if cle_root is None:
@@ -399,13 +594,13 @@ def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
             cle_root = None
     if cle_root is not None:
         cle_root = Path(cle_root).resolve()
-
+    
     for i, batch in enumerate(loader):
         clean_img_255, clean_text, tgt_img_255, tgt_text, clean_abs_paths = batch
         clean_img_255 = clean_img_255.to(dev)  # float32 0..255
         tgt_img_255   = tgt_img_255.to(dev)
-
         x0 = (clean_img_255 / 255.0).clamp(0.0, 1.0)
+        
         # Expect stacked targets: [B,K,C,H,W] (set stack_targets=True in your dataset)
         if tgt_img_255.dim() == 4:
             # No multi-targets present, treat as K=1
@@ -415,18 +610,21 @@ def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
                 f"Expected tgt_img_255 to be [B,K,C,H,W] or [B,C,H,W], "
                 f"got shape {tuple(tgt_img_255.shape)}. Set stack_targets=True in your dataset."
             )
-
         x_tg = (tgt_img_255 / 255.0).clamp(0.0, 1.0)  # [B,K,C,H,W]
         B, K = x_tg.size(0), x_tg.size(1)
-
+        
         # Cache target embeddings per encoder (no grad)
         with torch.no_grad():
             # Will hold, per encoder:
             # - for 'mean': [B,D] normalized
             # - for 'each': [B,K,D], each feature normalized
             cached_targets = []
+            # Also cache clean image embeddings for negative loss
+            cached_clean_embs = []
+            
             x_tg_flat = x_tg.view(B * K, *x_tg.shape[2:])  # [B*K,C,H,W]
             for enc in encoders:
+                # Target embeddings
                 f_tg_flat = enc.target_embed(x_tg_flat)  # [B*K, D], assumed L2-normalized
                 f_tg = f_tg_flat.view(B, K, -1)          # [B,K,D]
                 if args.multi_target_method == "mean":
@@ -436,33 +634,63 @@ def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
                 else:  # "each"
                     # Keep all per-target embeddings
                     cached_targets.append(f_tg)          # [B,K,D]
-
+                
+                # Clean image embeddings
+                f_clean = enc.forward_embed(x0)         # [B,D], L2-normalized
+                cached_clean_embs.append(f_clean)        # [B,D]
+        
         # Single perturbation in pixel space
         delta = torch.zeros_like(x0, requires_grad=True)
         for j in range(steps):
             x_adv = (x0 + delta).clamp(0.0, 1.0)
-
+            
             # Sum cosine similarities across encoders (and across targets if method='each')
             total_sim = 0.0
             sims = []  # per-encoder scalar for logging
+            clean_sims = []  # per-encoder clean similarity for logging
+            target_sims_per_encoder = []  # per-target similarities for logging
+            
             for k, enc in enumerate(encoders):
                 f_adv = enc.forward_embed(x_adv)  # [B,D], L2-normalized
-
+                
+                # Target similarity (positive loss)
                 if args.multi_target_method == "mean":
                     # cached_targets[k]: [B,D]
                     sim_k_b = torch.sum(f_adv * cached_targets[k], dim=1)  # [B]
                     sim_k = sim_k_b.mean()  # scalar
+                    target_sims = [sim_k.detach()]  # single value for mean method
                 else:
                     # cached_targets[k]: [B,K,D]
                     # Cosine for each target: (B,D) x (B,K,D) -> (B,K)
                     sim_bk = torch.einsum("bd,bkd->bk", f_adv, cached_targets[k])  # [B,K]
-                    # Sum over K targets, then mean over batch
-                    sim_k = sim_bk.sum(dim=1).mean()  # scalar; max = K if all 1's
-
+                    
+                    # Apply target weights if specified
+                    if target_weights_tensors is not None and k < len(target_weights_tensors):
+                        if len(target_weights_tensors[k]) == K:
+                            # Weight each target individually
+                            weighted_sim_bk = sim_bk * target_weights_tensors[k].unsqueeze(0)
+                            sim_k = weighted_sim_bk.sum(dim=1).mean()  # scalar
+                        else:
+                            # Use single weight for all targets
+                            sim_k = sim_bk.sum(dim=1).mean() * target_weights_tensors[k][0]
+                    else:
+                        # No weights, sum all targets
+                        sim_k = sim_bk.sum(dim=1).mean()  # scalar
+                    
+                    target_sims = sim_bk.mean(dim=0).detach().cpu().numpy().tolist()  # [K]
+                
                 sims.append(sim_k.detach())
-                total_sim = total_sim + weights_tensor[k] * sim_k
-
-            # Gradient ascent on similarity
+                target_sims_per_encoder.append(target_sims)
+                
+                # Clean similarity (negative loss)
+                clean_sim_k = torch.sum(f_adv * cached_clean_embs[k], dim=1).mean()  # scalar
+                clean_sims.append(clean_sim_k.detach())
+                
+                # Combine target similarity (positive) and clean similarity (negative)
+                encoder_loss = weights_tensor[k] * (sim_k - clean_sim_weight * clean_sim_k)
+                total_sim = total_sim + encoder_loss
+            
+            # Gradient ascent on total similarity
             total_sim.backward()
             with torch.no_grad():
                 grad = delta.grad
@@ -471,22 +699,32 @@ def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
                 delta.clamp_(-epsilon, epsilon)
                 delta.copy_((x0 + delta).clamp(0.0, 1.0) - x0)
                 delta.grad.zero_()
-
+            
             # Logging
             if (j % max(1, steps // 10) == 0) or (j == steps - 1):
                 max_delta = torch.max(torch.abs(delta)).item()
                 mean_delta = torch.mean(torch.abs(delta)).item()
                 sim_vals = [f"{s.item():.5f}" for s in sims]
+                clean_sim_vals = [f"{s.item():.5f}" for s in clean_sims]
+                target_sim_strs = []
+                for ts_list in target_sims_per_encoder:
+                    if isinstance(ts_list, list):
+                        target_sim_strs.append("[" + ", ".join([f"{t:.5f}" for t in ts_list]) + "]")
+                    else:
+                        target_sim_strs.append(f"{ts_list:.5f}")
+                
                 method = args.multi_target_method
                 print(
                     f"iter {i+1}/{total_batches} step:{j:3d} [{method}] "
-                    f"total_sim={float(total_sim.item()):.5f}, sims={sim_vals}, "
+                    f"total_sim={float(total_sim.item()):.5f}, "
+                    f"target_sims={sim_vals}, clean_sims={clean_sim_vals}, "
+                    f"per_target_sims={target_sim_strs}, "
                     f"max|delta|={max_delta:.4f}, mean|delta|={mean_delta:.4f}"
                 )
-
+        
         with torch.no_grad():
             adv_image_vis = (x0 + delta).clamp(0.0, 1.0)
-
+        
         # Save under class folders and write annotation
         for b in range(adv_image_vis.size(0)):
             clean_abs = Path(clean_abs_paths[b]).resolve()
@@ -500,13 +738,11 @@ def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
                         class_name = parts[0]
                 except Exception:
                     pass
-
             class_dir = (out_root / class_name)
             class_dir.mkdir(parents=True, exist_ok=True)
             stem = clean_abs.stem
             out_path = (class_dir / f"{stem}.png").resolve()
             torchvision.utils.save_image(adv_image_vis[b], str(out_path))
-
             rec = {"image": str(out_path), "text": str(tgt_text[b])}
             if ann_writer is not None:
                 ann_writer.write(rec)
@@ -516,8 +752,6 @@ def train_attackvlm_multiencoder(args, loader, dev, ann_writer):
                     annotations.append(rec)  # type: ignore[name-defined]
                 except Exception:
                     pass
-
-
 ############################################################################################################
 ############################################################################################################
 ############################################################################################################

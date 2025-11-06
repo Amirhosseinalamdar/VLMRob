@@ -198,7 +198,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--method", choices=["coa", "attackvlm", "attackvlm_multi", "attackvlm_losses", "attackvlm_grow"], default="coa",
                    help="Which attack pipeline to run.")
     p.add_argument("--image_encoder",
-        choices=["attackvlm_default", "B_16", "B_32", "L_32", "B_16_imagenet1k", "B_32_imagenet1k", "L_16_imagenet1k", "L_32_imagenet1k"],
+        choices=["blip_caption", "attackvlm_default", "B_16", "B_32", "L_32", "B_16_imagenet1k", "B_32_imagenet1k", "L_16_imagenet1k", "L_32_imagenet1k"],
         default="", help="ViT-PyTorch variants. \"\" when using CLIP's image encoder.")
 
     # AttackVLM-specific knobs (ignored by 'coa')

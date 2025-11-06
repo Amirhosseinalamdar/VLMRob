@@ -247,7 +247,7 @@ class VisionTransformer(nn.Module):
 
     #     return x
 
-    def forward(self, x: torch.Tensor, output_layers: list = None):
+    def forward(self, x: torch.Tensor, output_layers: list = None, top_k: int = 0):
         x = self.conv1(x)  # [B, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # [B, width, grid**2]
         x = x.permute(0, 2, 1)  # [B, grid**2, width]
@@ -260,6 +260,49 @@ class VisionTransformer(nn.Module):
         # add positional embeddings
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
+
+
+        if top_k is not None and top_k > 0:
+            # make sure we require grad for this tensor
+            x.requires_grad_(True)
+
+            # nested hook captures top_k variable and device/dtype naturally
+            def _zero_topk_patch_grads(grad):
+                """
+                grad: Tensor with same shape as x: [B, L, C]
+                We zero gradients for top_k patches with largest norm per sample,
+                excluding class token at index 0.
+                """
+                # grad.norm across embedding dim -> [B, L]
+                grad_norm = grad.norm(p=2, dim=-1)  # shape: [B, L]
+
+                # exclude class token (index 0) from ranking: work on a slice
+                patch_norms = grad_norm[:, 1:]  # [B, L-1]
+
+                # if there are fewer patches than k, clamp k
+                k = min(top_k, patch_norms.shape[1]) if patch_norms.shape[1] > 0 else 0
+                if k == 0:
+                    return grad  # nothing to zero
+
+                # get indices of top-k largest norms for each sample (batch)
+                # topk returns (values, indices) where indices are in range [0, L-2] for patch_norms
+                _, topk_idx = torch.topk(patch_norms, k=k, dim=1, largest=True, sorted=False)  # [B, k]
+
+                # create mask of ones for patches to KEEP (1), and zero for those to drop
+                mask_patches = torch.ones_like(patch_norms, device=grad.device, dtype=grad.dtype)  # [B, L-1]
+                # scatter zeros at topk positions
+                mask_patches.scatter_(1, topk_idx, 0.0)
+
+                # add back class token mask = 1 at index 0
+                cls_mask = torch.ones((grad.shape[0], 1), device=grad.device, dtype=grad.dtype)  # [B,1]
+                full_mask = torch.cat([cls_mask, mask_patches], dim=1).unsqueeze(-1)  # [B, L, 1]
+
+                # apply mask to gradient (broadcast over embedding dim)
+                grad = grad * full_mask
+                return grad
+
+            # register hook (will be called during backward)
+            x.register_hook(_zero_topk_patch_grads)
 
         # transformer expects [L, B, C]
         x = x.permute(1, 0, 2)

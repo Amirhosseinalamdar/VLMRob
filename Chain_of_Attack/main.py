@@ -95,11 +95,29 @@ def train_coa(args, ann_writer, dataset, dev):
     finally:
         ann_writer.close()
 
-
 def train_attackvlm(args, loader, dev, ann_writer):
     import open_clip  # lazy import
-
-    if args.image_encoder == "attackvlm_default": 
+    
+    # Initialize variables that need to be accessible throughout the function
+    processor = None
+    model = None
+    image_encoder_mean = None
+    image_encoder_std = None
+    
+    if args.image_encoder == "blip_caption":
+        print(f"Loading BLIP image captioning model: base_coco ...")
+        from transformers import BlipProcessor, BlipForConditionalGeneration
+        
+        # Load BLIP model for image captioning
+        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(dev)
+        
+        # BLIP uses different normalization than CLIP/ViT
+        # Standard ImageNet normalization used by BLIP
+        image_encoder_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=dev)
+        image_encoder_std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=dev)
+        
+    elif args.image_encoder == "attackvlm_default": 
         print(f"Loading open_clip model: {args.attackvlm_model_name} ({args.attackvlm_pretrained}) ...")
         model, _, _ = open_clip.create_model_and_transforms(
             args.attackvlm_model_name, pretrained=args.attackvlm_pretrained, device=dev
@@ -114,54 +132,68 @@ def train_attackvlm(args, loader, dev, ann_writer):
         
     model.eval()
     print("Done.")
-
     scaling_tensor = image_encoder_std.view(3, 1, 1).unsqueeze(0)  # (1,3,1,1)
     alpha   = args.alpha   / 255.0 / scaling_tensor
     epsilon = args.epsilon / 255.0 / scaling_tensor
-
     inverse_normalize = torchvision.transforms.Normalize(
         mean=(-image_encoder_mean / image_encoder_std).tolist(),
         std=(1.0 / image_encoder_std).tolist(),
     )
-
     out_root = Path(args.output).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
-
     total_batches = (len(loader.dataset) + args.batch_size - 1) // args.batch_size
-
+    
     def to_clip_norm(x_255: torch.Tensor) -> torch.Tensor:
         x_01 = x_255 / 255.0
         return (x_01 - image_encoder_mean.view(1, 3, 1, 1)) / image_encoder_std.view(1, 3, 1, 1)
-
+    
+    # Function to get image features based on model type
+    def get_image_features(model, images):
+        if args.image_encoder == "blip_caption":
+            # For BLIP, we need to use the vision encoder part and extract features
+            # BLIP processes images through its vision encoder to get features
+            vision_outputs = model.vision_model(pixel_values=images)
+            image_features = vision_outputs[0][:, 0, :]  # Take the [CLS] token features
+            return image_features
+        else:
+            # For CLIP/ViT models
+            return model.encode_image(images)
+    
     for i, batch in enumerate(loader):
         clean_img_255, clean_text, tgt_img_255, tgt_text, clean_abs_paths = batch
         clean_img_255 = clean_img_255.to(dev)  # (B,3,H,W), 0..255 float32
-        tgt_img_255   = tgt_img_255.to(dev)
-
+        tgt_img_255   = tgt_img_255[:, 0, :, :, :].to(dev)
+        
+        # For BLIP, we need to ensure the image size is compatible (224x224)
+        if args.image_encoder == "blip_caption":
+            # Resize images to 224x224 for BLIP if needed
+            resize_transform = torchvision.transforms.Resize((224, 224), antialias=True)
+            clean_img_255 = resize_transform(clean_img_255)
+            tgt_img_255 = resize_transform(tgt_img_255)
+        
         image_org = to_clip_norm(clean_img_255)
         image_tgt = to_clip_norm(tgt_img_255)
-
+        
         with torch.no_grad():
-            tgt_feats = model.encode_image(image_tgt)             # (B, D)
+            tgt_feats = get_image_features(model, image_tgt)  # (B, D)
             tgt_feats = F.normalize(tgt_feats, dim=1)
-
+        
         delta = torch.zeros_like(image_org, requires_grad=True)
         steps = getattr(args, "pgd_steps", 300)
-
+        
         for j in range(steps):
             adv_image = image_org + delta
-            adv_feats = model.encode_image(adv_image)
+            adv_feats = get_image_features(model, adv_image)
             adv_feats = F.normalize(adv_feats, dim=1)
-
             embedding_sim = torch.mean(torch.sum(adv_feats * tgt_feats, dim=1))
             embedding_sim.backward()
-
+            
             with torch.no_grad():
                 grad = delta.grad.detach()
                 delta.add_(alpha * torch.sign(grad))
                 delta.clamp_(min=-epsilon, max=epsilon)
                 delta.grad.zero_()
-
+            
             max_delta = torch.max(torch.abs(delta)).item()
             mean_delta = torch.mean(torch.abs(delta)).item()
             print(
@@ -169,14 +201,13 @@ def train_attackvlm(args, loader, dev, ann_writer):
                 f"embedding similarity={embedding_sim.item():.5f}, "
                 f"max delta={max_delta:.3f}, mean delta={mean_delta:.3f}"
             )
-
+        
         with torch.no_grad():
             adv_image_vis = torch.clamp(inverse_normalize(image_org + delta), 0.0, 1.0)
-
+        
         # Save under class folders derived from CLE_DATA_ROOT and write annotation
         for b in range(adv_image_vis.size(0)):
             clean_abs = Path(clean_abs_paths[b])
-
             try:
                 rel = clean_abs.resolve().relative_to(CLE_DATA_ROOT)
                 parts = rel.parts
@@ -188,14 +219,11 @@ def train_attackvlm(args, loader, dev, ann_writer):
                     class_name = clean_abs.parent.name
             except Exception:
                 class_name = clean_abs.parent.name
-
             class_dir = (out_root / class_name)
             class_dir.mkdir(parents=True, exist_ok=True)
-
             stem = clean_abs.stem
             out_path = (class_dir / f"{stem}.png").resolve()
             torchvision.utils.save_image(adv_image_vis[b], str(out_path))
-
             rec = {"image": str(out_path), "text": str(tgt_text[b])}
             if ann_writer is not None:
                 ann_writer.write(rec)

@@ -17,15 +17,17 @@ import torch.nn.functional as F
 from trainers import *
 import numpy as np
 
+from torchvision import transforms
+
 from CLIP import clip
 
 # from open_clip.src import open_clip
-import open_clip
+from open_clip2.src import open_clip
 # from diffusers.src.diffusers import DiffusionPipeline
-import diffusers
+from diffusers import DiffusionPipeline
 
 def get_clip_model(device):
-    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms('ViT-H-14', pretrained='laion2b_s32b_b79k')
+    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms('ViT-H-14', pretrained='/home/user01/research/Chain_of_Attack/open_clip2/weights/CLIP-ViT-H-14-laion2B-s32B-b79K.pt')
     return clip_model.to(device), clip_preprocess
 
 def get_clip_image_features(images, clip_model, clip_preprocess):
@@ -41,7 +43,7 @@ def get_clip_image_features(images, clip_model, clip_preprocess):
         Tensor of shape [B, D]: one feature vector per image
     """
     # Preprocess all images
-    inputs = torch.stack([clip_preprocess(image) for image in images]).to("cuda")  # [B, 3, H, W]
+    inputs = torch.stack([clip_preprocess(image) for image in images]).to("cuda").half()  # [B, 3, H, W]
 
     image_features = clip_model.encode_image(inputs)  # [B, D]
 
@@ -58,7 +60,7 @@ def decode_latents(pipe, latents):
 def get_diffusione_model_preprocess():
     preprocess = transforms.Compose([
         transforms.Resize((768, 768)),
-        transforms.ToTensor(),  
+        # transforms.ToTensor(),  
     ])
     return preprocess
 
@@ -169,7 +171,8 @@ def get_vae_features(images, pipe, preprocess):
     for img in images:
         tensors.append(preprocess(img).half().to('cuda'))
 
-    z_t = pipe.vae.encode(torch.stack(tensors)).latent_dist.sample() * pipe.vae.config.scaling_factor
+    with torch.no_grad():
+        z_t = pipe.vae.encode(torch.stack(tensors)).latent_dist.sample() * pipe.vae.config.scaling_factor
     
     return z_t
 
@@ -177,6 +180,7 @@ def get_diffusion_model(device):
     pipe = DiffusionPipeline.from_pretrained(
         "stabilityai/stable-diffusion-2-1-unclip",
         torch_dtype=torch.float16,
+        # cache_dir="/home/user01/.cache/huggingface/hub/models--stabilityai--stable-diffusion-2-1-unclip"
     ).to(device)
     return pipe
 
@@ -216,19 +220,30 @@ def new_attack(args, loader, dev, ann_writer):
         clean_img_255 = clean_img_255.to(dev).squeeze(1)  # (B,3,H,W), 0..255 float32
         tgt_img_255   = tgt_img_255.to(dev).squeeze(1)
 
-        image_org /= 255#preprocess(clean_img_255)
-        image_tgt /= 255#preprocess(tgt_img_255)
+        print(clean_text, "\n", tgt_text)
 
-        vae = get_vae_features([image_org], unclip_pipe, unclip_preprocess)
+        image_org = clean_img_255 / 255#preprocess(clean_img_255)
+        image_tgt = tgt_img_255 / 255#preprocess(tgt_img_255)
+
+        vae = get_vae_features(image_org, unclip_pipe, unclip_preprocess)
+        print("-----------------------")
 
         delta = torch.zeros_like(image_org, requires_grad=True)
-        steps = args.steps
+        steps = args.pgd_steps
 
         for j in range(steps):
             adv_image = image_org + delta
-            adv_embds = get_clip_image_features(adv_image, model, preprocess)
 
-            generate_image(unclip, adv_embds.half(), vae, prompt=tgt_text, negative_prompt=clean_text, device=dev)
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                adv_embds = get_clip_image_features(adv_image, model, preprocess)
+
+                image_gen = generate_image(unclip_pipe, vae, adv_embds.half(), prompt=tgt_text[0], negative_prompt=clean_text[0], device=dev)
+
+            image_gen = image_gen.float()
+            image_tgt_tensor = unclip_preprocess(image_tgt).half().to(dev)
+            image_tgt_tensor = torch.nn.functional.interpolate(image_tgt_tensor, size=image_gen.shape[-2:], mode='bilinear', align_corners=False)
+
+            loss = torch.nn.functional.mse_loss(image_gen, image_tgt_tensor)
 
             loss.backward()
 
@@ -237,6 +252,9 @@ def new_attack(args, loader, dev, ann_writer):
                 delta.add_(alpha * torch.sign(grad))
                 delta.clamp_(min=-epsilon, max=epsilon)
                 delta.grad.zero_()
+
+            del adv_image, adv_embds, image_gen, image_tgt_tensor, loss, grad
+            torch.cuda.empty_cache()
 
             max_delta = torch.max(torch.abs(delta)).item()
             mean_delta = torch.mean(torch.abs(delta)).item()
@@ -294,7 +312,7 @@ def main(args):
 
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=1,#args.batch_size,
         shuffle=False,
         num_workers=getattr(args, "num_workers", 8),
         drop_last=False,

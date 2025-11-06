@@ -84,6 +84,83 @@ def generate_cap(model: ClipCaptionModel, tokenizer, embed, entry_length=67, top
         output_text = tokenizer.decode(output_list)
     return output_text
 
+def generate_cap_batch(
+        model,
+        tokenizer,
+        embeds,  # Tensor: [batch_size, prefix_size]
+        entry_length=67,
+        top_p=0.8,
+        temperature=1.,
+        stop_token='.',
+):
+    """
+    Generate captions for a batch of image embeddings.
+
+    Args:
+        model: The ClipCaptionModel.
+        tokenizer: The GPT2 tokenizer.
+        embeds (torch.Tensor): Batch of CLIP image embeddings [batch_size, prefix_size].
+        entry_length (int): Max caption length (in tokens).
+        top_p (float): Nucleus sampling parameter.
+        temperature (float): Softmax temperature.
+        stop_token (str): Stop generation when this token is reached.
+
+    Returns:
+        List[str]: List of generated captions, length == batch_size.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    batch_size = embeds.size(0)
+    stop_token_index = tokenizer.encode(stop_token)[0]
+    filter_value = -float("Inf")
+
+    with torch.no_grad():
+        # Project CLIP embeddings to GPT2 prefix embeddings
+        prefix_embed = model.clip_project(embeds).view(batch_size, model.prefix_length, model.gpt_embedding_size)
+
+        # Initialize token embeddings (start from prefix only)
+        generated = prefix_embed
+        tokens = model.get_dummy_token(batch_size, device)
+
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        results = [""] * batch_size
+
+        for _ in range(entry_length):
+            outputs = model.gpt(inputs_embeds=generated)
+            logits = outputs.logits[:, -1, :] / temperature
+
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
+
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+
+            # Recreate logits so they match original order
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                1, sorted_indices, sorted_indices_to_remove
+            )
+
+            logits = logits.masked_fill(indices_to_remove, filter_value)
+
+            next_tokens = torch.argmax(logits, -1)
+            next_token_embeds = model.gpt.transformer.wte(next_tokens.unsqueeze(1))
+
+            tokens = torch.cat((tokens, next_tokens.unsqueeze(1)), dim=1)
+            generated = torch.cat((generated, next_token_embeds), dim=1)
+
+            newly_finished = next_tokens == stop_token_index
+            finished |= newly_finished
+            if finished.all():
+                break
+
+        # Decode all captions
+        for i in range(batch_size):
+            output_list = tokens[i].squeeze().cpu().numpy().tolist()
+            results[i] = tokenizer.decode(output_list, skip_special_tokens=True).replace("!", "")
+
+    return results
+
 # ----------------------- Surrogate base -----------------------
 class SurrogateBase:
     name: str = "base"
@@ -214,6 +291,34 @@ class ClipSurrogate(SurrogateBase):
         prefix = self.clip_model.encode_image(processed_img).to(self.dev, dtype=torch.float32)
         prefix_embed = self.caption_model.clip_project(prefix).reshape(1, self.prefix_length, -1)
         return generate_cap(self.caption_model, self.tokenizer, embed=prefix_embed)
+
+    @torch.no_grad()
+    def generate_caption_from_batch(self, pil_images: list) -> list[str]:
+        self.caption_model.eval()
+        self.clip_model.eval()
+
+        # Preprocess all images for CLIP in a batch
+        processed_imgs = torch.stack(
+            [self.clip_preprocess_for_caption(pil_img) for pil_img in pil_images]
+        ).to(self.dev)
+
+        with torch.no_grad():
+            # Encode each image into CLIP embeddings
+            prefixes = self.clip_model.encode_image(processed_imgs)
+            prefixes = prefixes.to(self.dev, dtype=torch.float32)
+
+            # Generate captions in batch
+            captions = generate_cap_batch(
+                model=self.caption_model,
+                tokenizer=self.tokenizer,
+                embeds=prefixes,
+                entry_length=50,
+                top_p=0.8,
+                temperature=1.0,
+            )
+
+        return captions
+
 
 
 # --- registry update ---

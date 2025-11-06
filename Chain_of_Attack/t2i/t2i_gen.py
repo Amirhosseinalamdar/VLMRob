@@ -3,7 +3,22 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Iterable, Optional
 from collections import defaultdict
 import random
+import argparse
+import hashlib
+import json
+import os
+import random
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import torch
+from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
+from tqdm import tqdm
+
+import nltk
+from nltk.corpus import wordnet as wn  # type: ignore
+_WORDNET_OK = True
 import torch
 from PIL import Image
 from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
@@ -147,6 +162,238 @@ def slugify(text: str, maxlen: int = 64) -> str:
     text = re.sub(r"[^A-Za-z0-9_\-]+", "", text)
     return text[:maxlen] if text else "caption"
 
+
+
+# Conservative close-concept replacements aligned with common COCO categories
+COCO_CLOSE_CONCEPTS: Dict[str, List[str]] = {
+    "person": ["man", "woman", "boy", "girl"],
+    "man": ["person", "gentleman"],
+    "woman": ["person", "lady"],
+    "boy": ["child", "kid"],
+    "girl": ["child", "kid"],
+
+    "dog": ["puppy", "canine", "shepherd"],
+    "cat": ["kitten", "tabby", "feline"],
+    "bird": ["sparrow", "parrot", "songbird"],
+    "horse": ["pony", "stallion", "mare"],
+    "cow": ["calf", "heifer"],
+    "sheep": ["lamb"],
+    "elephant": ["calf elephant"],
+    "bear": ["grizzly", "brown bear"],
+    "zebra": ["foal zebra"],
+    "giraffe": ["young giraffe"],
+
+    "car": ["sedan", "sports car", "hatchback"],
+    "bus": ["coach", "school bus"],
+    "truck": ["pickup truck", "lorry"],
+    "motorcycle": ["motorbike", "scooter"],
+    "bicycle": ["road bike", "mountain bike"],
+    "boat": ["sailboat", "speedboat"],
+    "train": ["subway train", "commuter train"],
+    "airplane": ["jet", "airliner"],
+
+    "chair": ["armchair", "stool"],
+    "couch": ["sofa", "loveseat"],
+    "bed": ["bunk bed", "queen bed"],
+    "table": ["dining table", "coffee table"],
+    "tv": ["television", "flat-screen tv"],
+    "laptop": ["notebook computer"],
+    "cell phone": ["smartphone", "mobile phone"],
+    "remote": ["remote control"],
+    "keyboard": ["computer keyboard"],
+    "mouse": ["computer mouse"],
+    "toilet": ["restroom toilet"],
+    "sink": ["bathroom sink"],
+    "refrigerator": ["fridge"],
+
+    "potted plant": ["houseplant", "succulent"],
+    "vase": ["flower vase"],
+    "bottle": ["glass bottle"],
+    "cup": ["mug"],
+    "bowl": ["dish"],
+    "knife": ["kitchen knife"],
+    "spoon": ["teaspoon"],
+    "fork": ["dining fork"],
+    "pizza": ["slice of pizza"],
+    "cake": ["cupcake", "birthday cake"],
+    "sandwich": ["sub sandwich"],
+    "hot dog": ["sausage"],
+    "donut": ["doughnut"],
+    "banana": ["ripe banana"],
+    "apple": ["green apple", "red apple"],
+    "orange": ["tangerine"],
+    "broccoli": ["broccolini"],
+    "carrot": ["baby carrot"],
+    "wine glass": ["champagne flute"],
+    "knife": ["chef's knife"],
+
+    "handbag": ["purse", "bag"],
+    "backpack": ["rucksack"],
+    "umbrella": ["parasol"],
+    "tie": ["necktie"],
+    "suitcase": ["luggage"],
+    "skateboard": ["longboard"],
+    "surfboard": ["shortboard"],
+    "tennis racket": ["racquet"],
+    "baseball bat": ["wooden bat"],
+    "baseball glove": ["mitt"],
+    "kite": ["stunt kite"],
+    "skis": ["downhill skis"],
+    "snowboard": ["freestyle snowboard"],
+
+    "traffic light": ["stoplight"],
+    "fire hydrant": ["hydrant"],
+    "stop sign": ["yield sign"],
+    "bench": ["park bench"],
+}
+
+PARAPHRASE_TEMPLATES = [
+    "a photo of {cap}",
+    "an image showing {cap}",
+    "a detailed photo of {cap}",
+    "a realistic photograph of {cap}",
+    "a high-quality image of {cap}",
+    "{cap}, high quality",
+    "a well-composed photo of {cap}",
+]
+
+STYLE_ADDONS = [
+    "natural lighting",
+    "soft lighting",
+    "high detail",
+    "sharp focus",
+    "shallow depth of field",
+    "wide shot",
+    "close-up shot",
+    "candid shot",
+]
+
+def maybe_inflect(original: str, replacement: str) -> str:
+    # naive plural handling for English nouns (keeps behavior predictable without extra deps)
+    if original.endswith("s") and not replacement.endswith("s"):
+        if replacement.endswith("y"):
+            return replacement[:-1] + "ies"
+        if replacement.endswith(("ch", "sh", "x", "z")):
+            return replacement + "es"
+        return replacement + "s"
+    return replacement
+
+def wordnet_synonym(word: str) -> Optional[str]:
+    if not _WORDNET_OK:
+        return None
+    try:
+        synsets = wn.synsets(word)
+        if not synsets:
+            return None
+        lemmas = set()
+        for s in synsets:
+            for l in s.lemmas():
+                lemma = l.name().replace("_", " ")
+                if lemma.lower() != word.lower():
+                    lemmas.add(lemma)
+        if not lemmas:
+            return None
+        return random.choice(sorted(lemmas))
+    except Exception:
+        return None
+
+def conservative_synonym(word: str) -> Optional[str]:
+    # prefer close-concept lexicon; else try wordnet; else None
+    if word.lower() in COCO_CLOSE_CONCEPTS:
+        return random.choice(COCO_CLOSE_CONCEPTS[word.lower()])
+    wn_syn = wordnet_synonym(word)
+    return wn_syn
+
+def paraphrase_caption(cap: str, rng: random.Random) -> str:
+    # pick a template and optionally append a mild style addon
+    tpl = rng.choice(PARAPHRASE_TEMPLATES)
+    base = tpl.format(cap=cap)
+    if rng.random() < 0.5:
+        addon = rng.choice(STYLE_ADDONS)
+        return f"{base}, {addon}"
+    return base
+
+def close_concept_variant(cap: str, rng: random.Random) -> Optional[str]:
+    """
+    Replace at most one token with a very close concept to keep semantics nearly identical.
+    Priority for tokens that exist in COCO_CLOSE_CONCEPTS.
+    """
+    tokens = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?|[^\w\s]", cap)
+    candidate_idxs = [i for i,t in enumerate(tokens) if re.fullmatch(r"[A-Za-z][A-Za-z'-]*", t)]
+    rng.shuffle(candidate_idxs)
+
+    for idx in candidate_idxs:
+        tok = tokens[idx]
+        repl = None
+        key = tok.lower()
+        if key in COCO_CLOSE_CONCEPTS:
+            repl = rng.choice(COCO_CLOSE_CONCEPTS[key])
+        else:
+            # very conservative: only attempt noun-ish words that are alphabetic and >2 chars
+            if len(tok) > 2:
+                syn = conservative_synonym(key)
+                if syn:
+                    repl = syn
+
+        if repl and repl.lower() != key:
+            repl = maybe_inflect(tok, repl)
+            tokens[idx] = repl
+            out = "".join(
+                (t if re.fullmatch(r"[A-Za-z]+(?:'[A-Za-z]+)?", t) else t)
+                if i == 0 or t in [",", ".", "!", "?", ":", ";"] else t
+                for i, t in enumerate(tokens)
+            )
+            # fix spacing around punctuation
+            out = re.sub(r"\s+([,.:;!?])", r"\1", out)
+            return out
+
+    return None  # no safe replacement found
+
+def make_prompt_variants(
+    cap: str,
+    n_paraphrase: int,
+    n_close: int,
+    rng: random.Random,
+) -> Dict[str, List[str]]:
+    """
+    Returns:
+      {
+        "base": [cap],
+        "paraphrase": [p1, p2, ...],
+        "close": [c1, c2, ...]
+      }
+    Only includes a key if n_* > 0 (except base).
+    """
+    out: Dict[str, List[str]] = {"base": [cap]}
+
+    if n_paraphrase > 0:
+        seen = set()
+        paraphrases = []
+        for _ in range(n_paraphrase * 3):  # allowance for dedup
+            p = paraphrase_caption(cap, rng)
+            if p not in seen and p != cap:
+                seen.add(p)
+                paraphrases.append(p)
+            if len(paraphrases) >= n_paraphrase:
+                break
+        if paraphrases:
+            out["paraphrase"] = paraphrases
+
+    if n_close > 0:
+        seen = set()
+        closes = []
+        for _ in range(n_close * 6):
+            c = close_concept_variant(cap, rng)
+            if c and c not in seen and c != cap:
+                seen.add(c)
+                closes.append(c)
+            if len(closes) >= n_close:
+                break
+        if closes:
+            out["close"] = closes
+
+    return out
+
 def build_sd_pipeline(model_id: str, torch_dtype: str = "float16", device: str = "cuda") -> StableDiffusionPipeline:
     dtype = torch.float16 if torch_dtype == "float16" and torch.cuda.is_available() else torch.float32
     pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype)
@@ -183,7 +430,6 @@ def txt2img(
     Path(os.path.dirname(out_path)).mkdir(parents=True, exist_ok=True)
     img.save(out_path)
     return out_path
-
 def build_jsonl_for_generation(
     ann_path: str,
     out_root: str,
@@ -197,20 +443,24 @@ def build_jsonl_for_generation(
     n_per_caption: int = 1,
     limit: Optional[int] = None,
     instances_path: Optional[str] = None,
+    # NEW: variation controls (all optional; defaults preserve existing behavior)
+    variants: str = "base",                 # comma-separated: base,paraphrase,close
+    n_paraphrase: int = 3,                  # number of paraphrases per caption (if enabled)
+    n_close: int = 2,                       # number of close-concept prompts per caption (if enabled)
+    variant_seed: int = 777,                # RNG seed for text variants
 ) -> str:
     """
-    Generates images for COCO captions and writes JSONL with {"image": "<relative path>", "text": "<caption>"}.
-    Images are saved under out_root/images/generated/.
-    Stratified sampling across categories based on instances annotations.
-    Always uses the first caption per image.
+    Generates images from COCO captions. Now supports prompt variants:
+      - base: original caption (exactly your current behavior and file layout)
+      - paraphrase: neutral rewordings, same semantics
+      - close: very close concepts (tiny noun/attribute shifts)
+    Each variant writes a separate JSONL and images folder.
+    Return value is the base JSONL path (for compatibility).
     """
     caps_by_img, _ = load_coco_captions(ann_path)
-
-    # Resolve instances file if not provided
     if not instances_path:
         instances_path = resolve_instances_path(ann_path)
 
-    # Build stratified list of image ids
     selected_img_ids = stratified_image_ids(
         caps_by_img=caps_by_img,
         instances_path=instances_path,
@@ -218,67 +468,185 @@ def build_jsonl_for_generation(
         seed=1234,
     )
 
-    out_images_root = os.path.join(out_root, "images", "generated")
+    out_images_root_base = os.path.join(out_root, "images", "generated")
     out_ann_dir = os.path.join(out_root, "annotations")
     Path(out_ann_dir).mkdir(parents=True, exist_ok=True)
-    jsonl_path = os.path.join(out_ann_dir, f"mscoco_t2i_{Path(ann_path).stem}_stratified.jsonl")
 
+    ann_stem = Path(ann_path).stem
+    jsonl_base = os.path.join(out_ann_dir, f"mscoco_t2i_{ann_stem}_stratified.jsonl")
+
+    # Prepare pipeline once
     pipe = build_sd_pipeline(model_id=model_id)
 
-    # Progress bar total is number of prompts we’ll run
-    total_samples = len(selected_img_ids) * max(1, int(n_per_caption))
-    if limit is not None:
-        total_samples = min(total_samples, int(limit))
+    # Parse variants
+    variant_keys = [v.strip().lower() for v in variants.split(",") if v.strip()]
+    if not variant_keys:
+        variant_keys = ["base"]
 
-    count = 0
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for img_id in tqdm(selected_img_ids, desc="Generating (stratified)", unit="img"):
-            # Always take the first caption for this image
-            cap = caps_by_img[img_id][0]
-            # Stable file naming: hash the caption
-            cap_slug = slugify(cap, 48)
-            cap_hash = hashlib.sha1(cap.encode("utf-8")).hexdigest()[:8]
+    # RNG for text variants
+    rng = random.Random(variant_seed if variant_seed is not None else 777)
 
-            for k in range(n_per_caption):
-                img_name = f"{img_id}_{cap_slug}_{cap_hash}_{k:02d}.png"
-                abs_img_path = os.path.join(out_images_root, img_name)
-                this_seed = None if seed is None else seed + count  # different seed per sample
+    produced_jsonls: Dict[str, str] = {}
 
-                txt2img(
-                    pipe,
-                    prompt=cap,
-                    out_path=abs_img_path,
-                    seed=this_seed,
-                    guidance_scale=guidance,
-                    num_inference_steps=steps,
-                    height=height,
-                    width=width,
-                )
-                rel_path = os.path.relpath(abs_img_path, start=out_images_root)
-                rec = {"image": rel_path, "text": cap}
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                count += 1
-                if limit is not None and count >= limit:
-                    break
-            if limit is not None and count >= limit:
-                break
+    for vkey in variant_keys:
+        is_base = (vkey == "base")
 
-    print(f"Wrote {count} lines to {jsonl_path}")
-    print(f"Images saved under: {out_images_root}")
-    print("JSONL 'image' paths are relative to the generated images folder.")
-    return jsonl_path
+        # For base variant, use original structure
+        if is_base:
+            out_images_root = out_images_root_base
+            jsonl_path = jsonl_base
+            Path(out_images_root).mkdir(parents=True, exist_ok=True)
+            
+            print(f"[{vkey}] Writing to: {jsonl_path}")
+            count = 0
+            vkey_offset = int(hashlib.sha1(vkey.encode("utf-8")).hexdigest(), 16) % 10_000_000
+            
+            with open(jsonl_path, "w", encoding="utf-8") as f:
+                for img_id in tqdm(selected_img_ids, desc=f"Generating ({vkey})", unit="img"):
+                    cap = caps_by_img[img_id][0]
+                    cap_slug = slugify(cap, 48)
+                    cap_hash = hashlib.sha1(cap.encode("utf-8")).hexdigest()[:8]
+                    
+                    pv_list = [(cap, 0)]  # Base always uses original caption
+                    
+                    for prompt_text, vi in pv_list:
+                        prompt_slug = slugify(prompt_text, 48)
+                        prompt_hash = hashlib.sha1(prompt_text.encode("utf-8")).hexdigest()[:8]
+                        
+                        for k in range(n_per_caption):
+                            img_name = f"{img_id}_{cap_slug}_{cap_hash}_v{vi:02d}_{prompt_slug}_{prompt_hash}_{k:02d}.png"
+                            abs_img_path = os.path.join(out_images_root, img_name)
+                            
+                            this_seed = None
+                            if seed is not None:
+                                base_count = count
+                                this_seed = seed + base_count + vkey_offset
+                            
+                            txt2img(
+                                pipe,
+                                prompt=prompt_text,
+                                out_path=abs_img_path,
+                                seed=this_seed,
+                                guidance_scale=guidance,
+                                num_inference_steps=steps,
+                                height=height,
+                                width=width,
+                            )
+                            
+                            rel_path = os.path.relpath(abs_img_path, start=out_images_root)
+                            rec = {"image": rel_path, "text": prompt_text}
+                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            count += 1
+                            
+                            if limit is not None and count >= limit:
+                                break
+                        
+                        if limit is not None and count >= limit:
+                            break
+                    if limit is not None and count >= limit:
+                        break
+            
+            print(f"[{vkey}] Wrote {count} lines to {jsonl_path}")
+            print(f"[{vkey}] Images under: {out_images_root}")
+            produced_jsonls[vkey] = jsonl_path
+        
+        else:
+            # For non-base variants (paraphrase/close), create separate folder for each variation
+            variants_map = {}
+            
+            # First, generate all variants for all captions
+            for img_id in selected_img_ids:
+                cap = caps_by_img[img_id][0]
+                if vkey == "paraphrase":
+                    variants_map[img_id] = make_prompt_variants(cap, n_paraphrase=n_paraphrase, n_close=0, rng=rng)
+                elif vkey == "close":
+                    variants_map[img_id] = make_prompt_variants(cap, n_paraphrase=0, n_close=n_close, rng=rng)
+            
+            # Create folders and generate for each variation index
+            for vi in range(max(n_paraphrase, n_close)):
+                if vkey == "paraphrase" and vi <= 5:
+                    continue
+                # Create variant-specific output folders
+                variant_out_root = os.path.join(out_root, f"{vkey}_v{vi:02d}")
+                variant_images_root = os.path.join(variant_out_root, "images", "generated")
+                variant_ann_dir = os.path.join(variant_out_root, "annotations")
+                Path(variant_images_root).mkdir(parents=True, exist_ok=True)
+                Path(variant_ann_dir).mkdir(parents=True, exist_ok=True)
+                
+                # Create variant-specific JSONL file
+                variant_jsonl_path = os.path.join(variant_ann_dir, f"mscoco_t2i_{ann_stem}_stratified.jsonl")
+                
+                print(f"[{vkey}_v{vi:02d}] Writing to: {variant_jsonl_path}")
+                count = 0
+                vkey_offset = int(hashlib.sha1(f"{vkey}_v{vi:02d}".encode("utf-8")).hexdigest(), 16) % 10_000_000
+                
+                with open(variant_jsonl_path, "w", encoding="utf-8") as variant_f:
+                    for img_id in tqdm(selected_img_ids, desc=f"Generating ({vkey}_v{vi:02d})", unit="img"):
+                        cap = caps_by_img[img_id][0]
+                        cap_slug = slugify(cap, 48)
+                        cap_hash = hashlib.sha1(cap.encode("utf-8")).hexdigest()[:8]
+                        
+                        # Get the specific variant for this image
+                        if img_id in variants_map:
+                            variant_list = variants_map[img_id].get(vkey, [])
+                            if vi < len(variant_list):
+                                prompt_text = variant_list[vi]
+                                
+                                prompt_slug = slugify(prompt_text, 48)
+                                prompt_hash = hashlib.sha1(prompt_text.encode("utf-8")).hexdigest()[:8]
+                                
+                                for k in range(n_per_caption):
+                                    img_name = f"{img_id}_{cap_slug}_{cap_hash}_v{vi:02d}_{prompt_slug}_{prompt_hash}_{k:02d}.png"
+                                    abs_img_path = os.path.join(variant_images_root, img_name)
+                                    
+                                    this_seed = None
+                                    if seed is not None:
+                                        base_count = count
+                                        this_seed = seed + base_count + vkey_offset
+                                    
+                                    txt2img(
+                                        pipe,
+                                        prompt=prompt_text,
+                                        out_path=abs_img_path,
+                                        seed=this_seed,
+                                        guidance_scale=guidance,
+                                        num_inference_steps=steps,
+                                        height=height,
+                                        width=width,
+                                    )
+                                    
+                                    rel_path = os.path.relpath(abs_img_path, start=variant_images_root)
+                                    rec = {"image": rel_path, "text": prompt_text}
+                                    variant_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                                    count += 1
+                                    
+                                    if limit is not None and count >= limit:
+                                        break
+                                
+                                if limit is not None and count >= limit:
+                                    break
+                    
+                    if limit is not None and count >= limit:
+                        break
+                
+                print(f"[{vkey}_v{vi:02d}] Wrote {count} lines to {variant_jsonl_path}")
+                print(f"[{vkey}_v{vi:02d}] Images under: {variant_images_root}")
+                produced_jsonls[f"{vkey}_v{vi:02d}"] = variant_jsonl_path
+
+    # For compatibility, return the base JSONL path if produced; else return the first produced
+    if "base" in produced_jsonls:
+        return produced_jsonls["base"]
+    # fall back to any variant's path if base not requested
+    return next(iter(produced_jsonls.values()))
+
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Generate images from COCO captions (stratified by category) and write JSONL.")
+    ap = argparse.ArgumentParser(description="Generate images from COCO captions (stratified by category) and write JSONL. Supports prompt variants.")
     ap.add_argument("--ann-path", required=True, help="Path to captions_train2017.json or captions_val2017.json")
     ap.add_argument("--out-root", required=True, help="Output root where images/ and annotations/ are created")
     ap.add_argument("--model-id", default="runwayml/stable-diffusion-v1-5", help="Diffusers model id")
-
-    # Fixed policy: first caption per image, so no --caption-policy arg.
     ap.add_argument("--total-captions", type=int, default=None,
-                    help="Total number of images/captions to sample (stratified across categories). "
-                         "If omitted, uses all eligible images.")
-
+                    help="Total number of images/captions to sample (stratified across categories). If omitted, uses all eligible images.")
     ap.add_argument("--n-per-caption", type=int, default=1, help="How many images to generate per (image, first-caption)")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--steps", type=int, default=30)
@@ -286,8 +654,17 @@ def parse_args():
     ap.add_argument("--height", type=int, default=512)
     ap.add_argument("--width", type=int, default=512)
     ap.add_argument("--limit", type=int, default=None, help="Stop after N generated samples (debug)")
-    ap.add_argument("--instances-path", type=str, default=None,
-                    help="Path to instances_{train,val}2017.json. If not set, inferred from --ann-path.")
+    ap.add_argument("--instances-path", type=str, default=None, help="Path to instances_{train,val}2017.json. If not set, inferred from --ann-path.")
+
+    # NEW: prompt variants
+    ap.add_argument("--variants", type=str, default="base",
+                    help="Comma-separated list of variants to generate: base,paraphrase,close")
+    ap.add_argument("--n-paraphrase", type=int, default=8,
+                    help="Number of paraphrases per caption when 'paraphrase' is enabled")
+    ap.add_argument("--n-close", type=int, default=3,
+                    help="Number of close-concept prompts per caption when 'close' is enabled")
+    ap.add_argument("--variant-seed", type=int, default=707, help="RNG seed for text variation generation")
+
     return ap.parse_args()
 
 if __name__ == "__main__":
@@ -305,4 +682,8 @@ if __name__ == "__main__":
         n_per_caption=args.n_per_caption,
         limit=args.limit,
         instances_path=args.instances_path,
+        variants=args.variants,
+        n_paraphrase=args.n_paraphrase,
+        n_close=args.n_close,
+        variant_seed=args.variant_seed,
     )
